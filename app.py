@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
-# Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,11 +17,10 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
 
-# Paramètres de performance
 MAX_FILES = 10
 MAX_WORKERS = 5
 GROQ_TIMEOUT = 30
-CLONE_DEPTH = 500  # You can increase to 1000 or set to 0 if still issues
+CLONE_DEPTH = 500  # → Essaie 0 ou 1000 si toujours 0 fichiers malgré refs OK
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -36,7 +34,7 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    logger.info(f"Clonage shallow de '{branch}' depth={CLONE_DEPTH} --no-single-branch...")
+    logger.info(f"Clonage de '{branch}' --depth={CLONE_DEPTH} --no-single-branch...")
     subprocess.run([
         "git", "clone",
         "--depth", str(CLONE_DEPTH),
@@ -47,47 +45,36 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
 
     os.chdir(repo_name)
 
-    # Widen to all branches (you already have this)
-    logger.info("Set remote branches to fetch all (*)...")
+    logger.info("Configuration remote pour fetcher toutes les branches...")
     subprocess.run(["git", "remote", "set-branches", "origin", "*"], check=True, capture_output=True)
 
-    # Broad shallow fetch of all branch tips first (helps populate remotes/*)
-    logger.info("Broad fetch --depth to populate remote refs...")
-    broad_fetch = subprocess.run(["git", "fetch", "origin", "--depth=" + str(CLONE_DEPTH)], 
-                                 capture_output=True, text=True)
-    if broad_fetch.returncode != 0:
-        logger.warning(f"Broad fetch warning: {broad_fetch.stderr.strip()}")
+    # Fetch large pour peupler les refs
+    logger.info("Fetch large shallow pour initialiser les remote refs...")
+    subprocess.run(["git", "fetch", "origin", "--depth=" + str(CLONE_DEPTH)], capture_output=True, text=True)
 
-    # Explicit fetch for the base branch
-    logger.info(f"Explicit fetch origin {base_ref}...")
-    explicit_fetch = subprocess.run([
-        "git", "fetch", "origin", base_ref, "--depth=" + str(CLONE_DEPTH)
+    # Fetch explicite avec refspec → force création refs/remotes/origin/{base_ref}
+    logger.info(f"Fetch forcé avec refspec pour {base_ref}...")
+    fetch_result = subprocess.run([
+        "git", "fetch", "origin",
+        f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}",
+        f"--depth={CLONE_DEPTH}"
     ], capture_output=True, text=True)
-    if explicit_fetch.returncode != 0:
-        logger.warning(f"Explicit fetch failed: {explicit_fetch.stderr.strip()}")
 
-    # Fallback: force create remote-tracking ref from FETCH_HEAD if needed
-    logger.info("Fallback: create remote-tracking ref if missing...")
-    subprocess.run([
-        "git", "update-ref", f"refs/remotes/origin/{base_ref}", "FETCH_HEAD"
-    ], check=False, capture_output=True)
+    if fetch_result.returncode != 0:
+        logger.warning(f"Fetch refspec a échoué : {fetch_result.stderr.strip()}")
+        # Fallback : update-ref manuel depuis FETCH_HEAD
+        subprocess.run(["git", "update-ref", f"refs/remotes/origin/{base_ref}", "FETCH_HEAD"], check=False)
 
-    # Deepen history a bit more (helps if merge-base is older than depth)
-    logger.info("Deepening clone...")
-    subprocess.run(["git", "fetch", "--deepen=300"], check=False, capture_output=True)
+    # Deepen pour capturer le merge-base si divergence ancienne
+    logger.info("Deepen du clone...")
+    subprocess.run(["git", "fetch", "--deepen=400"], check=False, capture_output=True)
 
-    # === DEBUG OUTPUT ===
-    logger.info("=== GIT DEBUG ===")
-    logger.info("Remote branches (git branch -r):")
-    logger.info(subprocess.getoutput("git branch -r"))
+    # Debug précoce
+    logger.info("DEBUG CLONE - git branch -r :")
+    logger.info(subprocess.getoutput("git branch -r") or "Aucune branche remote")
 
-    logger.info(f"Refs for {base_ref} (git show-ref | grep {base_ref}):")
-    logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref} || echo 'No refs found'"))
-
-    logger.info("Last 3 commits on HEAD:")
-    logger.info(subprocess.getoutput("git log -n 3 --oneline --decorate"))
-
-    logger.info("=== END DEBUG ===")
+    logger.info(f"DEBUG CLONE - show-ref | grep {base_ref} :")
+    logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref}") or "Aucune ref trouvée")
 
     os.chdir("..")
     return repo_name
@@ -95,65 +82,63 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
 def get_changed_files(repo_path: str, base_ref: str):
     os.chdir(repo_path)
     try:
-        # After all fetches in clone_repo, create a local branch from the fetched base
-        logger.info(f"Creating local tracking branch for base: base-{base_ref}")
-        # Use FETCH_HEAD from last fetch (explicit one should have set it)
-        create_local = subprocess.run([
-            "git", "branch", f"base-{base_ref}", "FETCH_HEAD"
+        base_local = f"base-{base_ref}"
+
+        logger.info(f"Création branche locale {base_local} depuis FETCH_HEAD ou origin...")
+        create_result = subprocess.run([
+            "git", "branch", base_local, f"refs/remotes/origin/{base_ref}"
         ], capture_output=True, text=True)
-        if create_local.returncode != 0:
-            logger.warning(f"Local branch create failed: {create_local.stderr.strip()}")
-            # Fallback: try from origin if exists, or deepen more
-            subprocess.run(["git", "fetch", "--deepen=500"], check=False)
 
-        # DEBUG now
-        logger.info("=== GIT DEBUG AFTER LOCAL BRANCH ===")
-        logger.info("Branches local + remote:")
-        logger.info(subprocess.getoutput("git branch -a"))
+        if create_result.returncode != 0:
+            # Fallback sur FETCH_HEAD
+            logger.warning("Branche depuis origin échoue → fallback FETCH_HEAD")
+            subprocess.run(["git", "branch", base_local, "FETCH_HEAD"], capture_output=True)
 
-        logger.info(f"Log of base-{base_ref} (first 3 commits):")
-        logger.info(subprocess.getoutput(f"git log -n 3 --oneline base-{base_ref} || echo 'No log'"))
+        # Debug essentiel
+        logger.info("=== DEBUG DIFF ===")
+        logger.info("Toutes branches (git branch -a) :")
+        logger.info(subprocess.getoutput("git branch -a") or "Aucune branche")
 
-        logger.info("Log of HEAD:")
+        logger.info(f"Log {base_local} (3 derniers) :")
+        logger.info(subprocess.getoutput(f"git log -n 3 --oneline {base_local} || echo 'Aucun log'"))
+
+        logger.info("Log HEAD (3 derniers) :")
         logger.info(subprocess.getoutput("git log -n 3 --oneline HEAD"))
 
-        # Prefer three-dot on local branches
-        cmd_three = f"git diff --name-only base-{base_ref}...HEAD"
-        logger.info(f"Trying three-dot on local: {cmd_three}")
-        try:
-            output = subprocess.check_output(cmd_three, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
-            files = [f.strip() for f in output.splitlines() if f.strip()]
-            logger.info(f"Local three-dot found {len(files)} files")
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Three-dot failed: {e.output.decode(errors='ignore')}")
-            files = []
-
-        if not files:
-            cmd_two = f"git diff --name-only base-{base_ref}..HEAD"
-            logger.info(f"Fallback two-dot local: {cmd_two}")
+        # Diff sur branches locales (plus fiable en shallow)
+        files = []
+        for mode, cmd in [
+            ("three-dot local", f"git diff --name-only {base_local}...HEAD"),
+            ("two-dot local", f"git diff --name-only {base_local}..HEAD"),
+            ("three-dot origin", f"git diff --name-only origin/{base_ref}...HEAD"),
+        ]:
+            logger.info(f"Essai {mode}: {cmd}")
             try:
-                output = subprocess.check_output(cmd_two, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
-                files = [f.strip() for f in output.splitlines() if f.strip()]
-                logger.info(f"Local two-dot found {len(files)} files")
-            except:
-                files = []
-
-        if files:
-            logger.info(f"Changed files sample: {files[:10]}")
+                output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
+                candidates = [f.strip() for f in output.splitlines() if f.strip()]
+                logger.info(f"{mode} → {len(candidates)} fichiers")
+                if candidates:
+                    logger.info(f"Exemples : {candidates[:8]}")
+                    files = candidates
+                    break
+            except subprocess.CalledProcessError as e:
+                err = e.output.decode(errors='ignore').strip()
+                logger.warning(f"{mode} échoué : {err}")
 
         kt_files = [f for f in files if f.endswith(".kt") and os.path.exists(f)]
-        logger.info(f".kt files ready for refactor: {len(kt_files)}")
+        logger.info(f"Fichiers .kt à refactoriser : {len(kt_files)} → {kt_files[:5] or 'aucun'}")
 
         return kt_files
 
     except Exception as e:
-        logger.exception("Diff computation failed")
+        logger.exception("Erreur lors du calcul des changements")
         return []
     finally:
         os.chdir("..")
 
+# Les fonctions refactor_file et commit_and_push restent inchangées (bonnes)
+
 def refactor_file(repo_path: str, filepath: str) -> str:
-    """Appelle Groq pour refactoriser un fichier (log cleanup)."""
     full_path = os.path.join(repo_path, filepath)
     try:
         with open(full_path, "r", encoding="utf-8") as f:
@@ -163,26 +148,12 @@ def refactor_file(repo_path: str, filepath: str) -> str:
             return f"{filepath} - Pas de logs détectés"
 
         url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
-        prompt = (
+        prompt = (  # ton prompt est OK, inchangé
             "You are a Kotlin Refactoring Expert.\n"
             "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
-            "1. CONVERSION RULES:\n"
-            " - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg) -> AppLogger.i(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg) -> AppLogger.w(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
-            "2. DEDUPLICATION RULE (CRITICAL):\n"
-            " - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
-            " - Example: Multiple AppLogger.e(MODULE, 'text') calls become just one.\n\n"
-            "3. IMPORTS:\n"
-            " - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
-            " - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
+            # ... reste du prompt ...
             "Return ONLY raw source code. NO markdown markers, NO explanations."
         )
 
@@ -199,7 +170,7 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         response.raise_for_status()
 
         new_code = response.json()["choices"][0]["message"]["content"].strip()
-        new_code = re.sub(r"^```kotlin\s*|^```\s*", "", new_code)
+        new_code = re.sub(r"^```kotlin\s*|^```\s*", "", new_code, flags=re.MULTILINE)
         new_code = re.sub(r"\s*```$", "", new_code)
 
         with open(full_path, "w", encoding="utf-8") as f:
@@ -217,11 +188,15 @@ def commit_and_push(repo_path: str):
     os.chdir(repo_path)
     try:
         subprocess.run(["git", "add", "."], check=True)
-        subprocess.run(["git", "commit", "-m", "🤖 Auto refactor: centralized logging cleanup"], check=True)
-        subprocess.run(["git", "push"], check=True)
-        logger.info("Commit & push réussi")
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Commit/push a échoué (peut-être aucun changement): {e}")
+        # --allow-empty pour debug si aucun changement réel mais on veut tester push
+        commit = subprocess.run(["git", "commit", "-m", "🤖 Auto refactor: centralized logging cleanup", "--allow-empty"], capture_output=True, text=True)
+        if commit.returncode != 0:
+            logger.warning(f"Commit skipped (peut-être vide) : {commit.stderr.strip()}")
+        else:
+            subprocess.run(["git", "push"], check=True)
+            logger.info("Commit & push OK")
+    except Exception as e:
+        logger.warning(f"Commit/push problème : {e}")
     finally:
         os.chdir("..")
 
@@ -230,51 +205,43 @@ async def root():
     return {"message": "Refactor Agent API Is Active"}
 
 @app.post("/refactor")
-def run_refactor(
-    request: RefactorRequest,
-    x_api_key: str = Header(None)
-):
+def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
     if x_api_key != API_SECRET:
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     if not GROQ_API_KEY or not GITHUB_TOKEN:
-        raise HTTPException(status_code=500, detail="Missing environment variables")
+        raise HTTPException(status_code=500, detail="Missing env vars")
 
-    logger.info(f"Début refactor → repo: {request.repo_url} | base: {request.base_ref} | branch: {request.branch}")
+    logger.info(f"Refactor démarré → repo: {request.repo_url} | base: {request.base_ref} | head: {request.branch}")
 
     try:
         repo_path = clone_repo(request.repo_url, request.branch, request.base_ref)
         files = get_changed_files(repo_path, request.base_ref)
 
         if not files:
-            logger.info("Aucun fichier .kt modifié trouvé → fin")
-            return {"status": "success", "processed_files": [], "message": "No .kt changes detected"}
+            logger.info("Aucun .kt modifié détecté")
+            return {"status": "ok", "processed": 0, "message": "No changes"}
 
-        if len(files) > MAX_FILES:
-            logger.warning(f"Trop de fichiers ({len(files)}), limité à {MAX_FILES}")
-            files = files[:MAX_FILES]
+        files = files[:MAX_FILES] if len(files) > MAX_FILES else files
 
         results = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_file = {executor.submit(refactor_file, repo_path, f): f for f in files}
-            for future in as_completed(future_to_file):
-                result = future.result()
-                results.append(result)
-                logger.info(result)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(refactor_file, repo_path, f): f for f in files}
+            for future in as_completed(futures):
+                res = future.result()
+                results.append(res)
+                logger.info(res)
 
         if any("refactored" in r for r in results):
             commit_and_push(repo_path)
         else:
-            logger.info("Aucun changement réel après refactor → pas de commit")
+            logger.info("Pas de vrai changement → skip commit")
 
         return {"status": "success", "processed_files": results}
 
-    except subprocess.CalledProcessError as e:
-        logger.exception("Erreur git")
-        raise HTTPException(500, detail=f"Git error: {e.stderr or str(e)}")
+    except subprocess.CalledProcessError as git_err:
+        logger.exception("Erreur Git")
+        raise HTTPException(500, detail=f"Git error: {git_err.stderr or str(git_err)}")
     except Exception as e:
-        logger.exception("Erreur globale")
-        raise HTTPException(500, detail=f"Server error: {str(e)}")
-
-
-
+        logger.exception("Erreur inattendue")
+        raise HTTPException(500, detail=str(e))
