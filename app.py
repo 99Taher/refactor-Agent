@@ -83,12 +83,34 @@ def get_changed_files(repo_path, base_ref):
         # FIXED: Utiliser FETCH_HEAD au lieu de origin/{base_ref}
         # FETCH_HEAD est créé automatiquement après le fetch
         logger.info("Calcul du diff...")
-        cmd = "git diff --name-only FETCH_HEAD..HEAD"
-        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+        
+        # Essayer les deux directions pour debug
+        cmd_forward = "git diff --name-only FETCH_HEAD..HEAD"
+        cmd_reverse = "git diff --name-only HEAD..FETCH_HEAD"
+        
+        # Direction 1: Changements dans test (HEAD) par rapport à base (FETCH_HEAD)
+        output_forward = subprocess.check_output(cmd_forward, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+        files_forward = output_forward.splitlines()
+        logger.info(f"[FETCH_HEAD..HEAD] Fichiers trouvés : {len(files_forward)}")
+        
+        # Direction 2: Changements dans base (FETCH_HEAD) par rapport à test (HEAD)
+        output_reverse = subprocess.check_output(cmd_reverse, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+        files_reverse = output_reverse.splitlines()
+        logger.info(f"[HEAD..FETCH_HEAD] Fichiers trouvés : {len(files_reverse)}")
+        
+        # Utiliser la direction qui a des fichiers
+        if len(files_forward) > 0:
+            all_files = files_forward
+            logger.info(f"Utilisation de FETCH_HEAD..HEAD (test en avance)")
+        elif len(files_reverse) > 0:
+            all_files = files_reverse
+            logger.info(f"Utilisation de HEAD..FETCH_HEAD (base en avance, test en retard)")
+        else:
+            all_files = []
+            logger.info("Aucune différence trouvée dans les deux directions")
         
         # DEBUG: Afficher TOUS les fichiers trouvés
-        all_files = output.splitlines()
-        logger.info(f"TOUS les fichiers trouvés par git diff : {len(all_files)} fichiers")
+        logger.info(f"TOUS les fichiers dans le diff choisi : {len(all_files)} fichiers")
         logger.info(f"Liste complète : {all_files[:20]}")  # Afficher les 20 premiers
         
         # Filtrer uniquement les .kt qui existent
