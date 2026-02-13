@@ -30,7 +30,7 @@ class RefactorRequest(BaseModel):
 
 
 def clone_repo(repo_url, branch):
-    """Clone le dépôt avec une profondeur de 1 (toutes les branches)."""
+    """Clone le dépôt sans limite de profondeur pour permettre les comparaisons."""
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     clone_url = repo_url.replace(
         "https://",
@@ -40,9 +40,9 @@ def clone_repo(repo_url, branch):
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
+    # FIXED: Removed --depth 1 to allow proper branch comparison
     subprocess.run([
         "git", "clone", "-b", branch,
-        "--depth", "1",
         clone_url
     ], check=True)
     return repo_name
@@ -52,27 +52,27 @@ def get_changed_files(repo_path, base_ref):
     """Retourne la liste des fichiers .kt modifiés entre base_ref et HEAD."""
     os.chdir(repo_path)
     try:
-        # Récupérer la branche de base avec profondeur 1
+        # Récupérer la branche de base (sans --depth pour avoir l'historique complet)
         logger.info(f"Récupération de la branche de base : origin/{base_ref}")
         fetch_result = subprocess.run(
-            ["git", "fetch", "origin", base_ref, "--depth=1"],
+            ["git", "fetch", "origin", base_ref],
             capture_output=True,
             text=True
         )
         if fetch_result.returncode != 0:
             logger.error(f"Échec du fetch de {base_ref}: {fetch_result.stderr}")
-            # Si le fetch échoue, on ne peut pas comparer, on retourne une liste vide
             return []
         else:
             logger.info(f"Branche {base_ref} récupérée avec succès")
 
-        # Maintenant faire le diff
+        # FIXED: Using .. instead of ... for better compatibility
         cmd = f"git diff --name-only origin/{base_ref}..HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         files = [
             f for f in output.splitlines()
             if f.endswith(".kt") and os.path.exists(f)
         ]
+        logger.info(f"Fichiers .kt trouvés après diff : {files}")
         return files
     except subprocess.CalledProcessError as e:
         logger.error(f"Erreur lors du diff: {e.stderr}")
@@ -116,7 +116,7 @@ def refactor_file(repo_path, filepath):
     )
 
     payload = {
-        "model": "mixtral-8x7b-32768",  # Plus rapide (vous pouvez changer)
+        "model": "mixtral-8x7b-32768",
         "messages": [
             {"role": "system", "content": "You are a Kotlin expert. Output only raw source code."},
             {"role": "user", "content": f"{prompt}\n\nCODE:\n{code}"}
@@ -212,4 +212,3 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur inattendue")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
