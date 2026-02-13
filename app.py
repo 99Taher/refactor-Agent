@@ -55,90 +55,47 @@ def clone_repo(repo_url, branch):
 
 
 def get_changed_files(repo_path, base_ref):
-    """Retourne la liste des fichiers .kt modifiés entre base_ref et HEAD."""
+    """Get changed .kt files: changes introduced in HEAD (test) compared to base_ref."""
     os.chdir(repo_path)
     try:
-        # Récupérer la branche de base avec la même profondeur
-        logger.info(f"Fetch de la branche {base_ref}...")
-        fetch_result = subprocess.run(
-            ["git", "fetch", "origin", base_ref, f"--depth={CLONE_DEPTH}"],
-            capture_output=True,
-            text=True
-        )
-        if fetch_result.returncode != 0:
-            logger.error(f"Échec du fetch de {base_ref}: {fetch_result.stderr}")
-            return []
-        
-        logger.info(f"Fetch réussi pour {base_ref}")
+        logger.info(f"Fetching origin/{base_ref} and HEAD with depth {CLONE_DEPTH}...")
+        # Fetch both explicitly
+        subprocess.run(["git", "fetch", "origin", base_ref, f"--depth={CLONE_DEPTH}"], check=True, capture_output=True)
+        subprocess.run(["git", "fetch", "origin", "HEAD", f"--depth={CLONE_DEPTH}"], check=True, capture_output=True)
 
-        # Unshallow si nécessaire pour avoir assez d'historique
-        logger.info("Deepening clone si nécessaire...")
-        subprocess.run(
-            ["git", "fetch", "--deepen=50"],
-            capture_output=True,
-            text=True
-        )
+        # Most accurate for PRs: changes since divergence (three dots)
+        cmd_three = f"git diff --name-only origin/{base_ref}...HEAD"
+        logger.info(f"Trying three-dot diff: {cmd_three}")
+        try:
+            output = subprocess.check_output(cmd_three, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
+            files = [f for f in output.splitlines() if f.strip()]
+            if files:
+                logger.info(f"Three-dot found {len(files)} files")
+            else:
+                logger.info("Three-dot found 0 files → falling back to two-dot")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Three-dot diff failed: {e.output.decode() if e.output else str(e)}")
+            files = []
 
-        # Créer une référence locale explicite pour la branche de base
-        logger.info("Calcul du diff...")
-        
-        # Créer une référence locale pour la branche de base
-        subprocess.run(
-            ["git", "branch", "-f", f"temp-base-{base_ref}", "FETCH_HEAD"],
-            capture_output=True,
-            text=True
-        )
-        
-        # Essayer les deux directions pour debug
-        cmd_forward = f"git diff --name-only temp-base-{base_ref}..HEAD"
-        cmd_reverse = f"git diff --name-only HEAD..temp-base-{base_ref}"
-        
-        # Direction 1: Changements dans test (HEAD) par rapport à base
-        try:
-            output_forward = subprocess.check_output(cmd_forward, shell=True, stderr=subprocess.PIPE).decode("utf-8")
-            files_forward = output_forward.splitlines()
-            logger.info(f"[base..HEAD] Fichiers trouvés : {len(files_forward)}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Erreur diff forward: {e.stderr}")
-            files_forward = []
-        
-        # Direction 2: Changements dans base par rapport à test
-        try:
-            output_reverse = subprocess.check_output(cmd_reverse, shell=True, stderr=subprocess.PIPE).decode("utf-8")
-            files_reverse = output_reverse.splitlines()
-            logger.info(f"[HEAD..base] Fichiers trouvés : {len(files_reverse)}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Erreur diff reverse: {e.stderr}")
-            files_reverse = []
-        
-        # Utiliser la direction qui a des fichiers
-        if len(files_forward) > 0:
-            all_files = files_forward
-            logger.info(f"Utilisation de base..HEAD (test en avance sur base)")
-        elif len(files_reverse) > 0:
-            all_files = files_reverse
-            logger.info(f"Utilisation de HEAD..base (base en avance sur test)")
-        else:
-            all_files = []
-            logger.info("Aucune différence trouvée dans les deux directions")
-        
-        # DEBUG: Afficher TOUS les fichiers trouvés
-        logger.info(f"TOUS les fichiers dans le diff choisi : {len(all_files)} fichiers")
-        if len(all_files) > 0:
-            logger.info(f"Liste complète : {all_files[:20]}")  # Afficher les 20 premiers
-        
-        # Filtrer uniquement les .kt qui existent
-        files = [
-            f for f in all_files
-            if f.endswith(".kt") and os.path.exists(f)
-        ]
-        
-        logger.info(f"Fichiers .kt trouvés : {len(files)} -> {files[:5]}...")
-        return files
-        
-    except subprocess.CalledProcessError as e:
-        stderr_msg = e.stderr.decode() if e.stderr else str(e)
-        logger.error(f"Erreur lors du diff: {stderr_msg}")
+        # Fallback: direct tip-to-tip
+        if not files:
+            cmd_two = f"git diff --name-only origin/{base_ref}..HEAD"
+            logger.info(f"Falling back to: {cmd_two}")
+            output = subprocess.check_output(cmd_two, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
+            files = [f for f in output.splitlines() if f.strip()]
+
+        logger.info(f"Total changed files found: {len(files)}")
+        if files:
+            logger.info(f"Changed files (first 10): {files[:10]}")
+
+        # Filter to existing .kt files only
+        kt_files = [f for f in files if f.endswith(".kt") and os.path.exists(f)]
+        logger.info(f" Kotlin (.kt) files to refactor: {len(kt_files)} → {kt_files[:5] or 'none'}...")
+
+        return kt_files
+
+    except Exception as e:
+        logger.exception("Failed to compute changed files")
         return []
     finally:
         os.chdir("..")
@@ -275,3 +232,4 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur inattendue")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
