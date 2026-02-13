@@ -22,6 +22,7 @@ API_SECRET = os.getenv("API_SECRET")
 MAX_FILES = 10
 MAX_WORKERS = 5
 GROQ_TIMEOUT = 30
+CLONE_DEPTH = 100  # Profondeur suffisante pour comparer les branches
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -30,7 +31,7 @@ class RefactorRequest(BaseModel):
 
 
 def clone_repo(repo_url, branch):
-    """Clone le dépôt sans limite de profondeur pour permettre les comparaisons."""
+    """Clone le dépôt avec profondeur optimisée pour rapidité + comparaison."""
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     clone_url = repo_url.replace(
         "https://",
@@ -40,11 +41,17 @@ def clone_repo(repo_url, branch):
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    # FIXED: Removed --depth 1 to allow proper branch comparison
+    # Clone avec profondeur limitée + single-branch pour rapidité
+    logger.info(f"Clone du repo avec depth={CLONE_DEPTH}...")
     subprocess.run([
-        "git", "clone", "-b", branch,
+        "git", "clone", 
+        "-b", branch,
+        "--depth", str(CLONE_DEPTH),
+        "--single-branch",
         clone_url
     ], check=True)
+    
+    logger.info(f"Clone terminé : {repo_name}")
     return repo_name
 
 
@@ -52,30 +59,43 @@ def get_changed_files(repo_path, base_ref):
     """Retourne la liste des fichiers .kt modifiés entre base_ref et HEAD."""
     os.chdir(repo_path)
     try:
-        # Récupérer la branche de base (sans --depth pour avoir l'historique complet)
-        logger.info(f"Récupération de la branche de base : origin/{base_ref}")
+        # Récupérer la branche de base avec la même profondeur
+        logger.info(f"Fetch de la branche {base_ref}...")
         fetch_result = subprocess.run(
-            ["git", "fetch", "origin", base_ref],
+            ["git", "fetch", "origin", base_ref, f"--depth={CLONE_DEPTH}"],
             capture_output=True,
             text=True
         )
         if fetch_result.returncode != 0:
             logger.error(f"Échec du fetch de {base_ref}: {fetch_result.stderr}")
             return []
-        else:
-            logger.info(f"Branche {base_ref} récupérée avec succès")
+        
+        logger.info(f"Fetch réussi pour {base_ref}")
 
-        # FIXED: Using .. instead of ... for better compatibility
+        # Unshallow si nécessaire pour avoir assez d'historique
+        logger.info("Deepening clone si nécessaire...")
+        subprocess.run(
+            ["git", "fetch", "--deepen=50"],
+            capture_output=True,
+            text=True
+        )
+
+        # Diff avec double-dot
+        logger.info("Calcul du diff...")
         cmd = f"git diff --name-only origin/{base_ref}..HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+        
         files = [
             f for f in output.splitlines()
             if f.endswith(".kt") and os.path.exists(f)
         ]
-        logger.info(f"Fichiers .kt trouvés après diff : {files}")
+        
+        logger.info(f"Fichiers .kt trouvés : {len(files)} -> {files[:5]}...")
         return files
+        
     except subprocess.CalledProcessError as e:
-        logger.error(f"Erreur lors du diff: {e.stderr}")
+        stderr_msg = e.stderr.decode() if e.stderr else str(e)
+        logger.error(f"Erreur lors du diff: {stderr_msg}")
         return []
     finally:
         os.chdir("..")
