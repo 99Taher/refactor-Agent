@@ -86,8 +86,14 @@ def get_changed_files(repo_path, base_ref):
         cmd = "git diff --name-only FETCH_HEAD..HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         
+        # DEBUG: Afficher TOUS les fichiers trouvés
+        all_files = output.splitlines()
+        logger.info(f"TOUS les fichiers trouvés par git diff : {len(all_files)} fichiers")
+        logger.info(f"Liste complète : {all_files[:20]}")  # Afficher les 20 premiers
+        
+        # Filtrer uniquement les .kt qui existent
         files = [
-            f for f in output.splitlines()
+            f for f in all_files
             if f.endswith(".kt") and os.path.exists(f)
         ]
         
