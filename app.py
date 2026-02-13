@@ -30,41 +30,62 @@ class RefactorRequest(BaseModel):
     branch: str = "auto-refactor"
 
 def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
-    """Clone le dépôt avec support multi-branches pour pouvoir fetch la base correctement."""
+    """Clone avec multi-branches + élargissement du refspec pour fetcher la base."""
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     clone_url = repo_url.replace("https://", f"https://{GITHUB_TOKEN}@")
 
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    logger.info(f"Clone du repo '{branch}' avec depth={CLONE_DEPTH} et --no-single-branch...")
+    logger.info(f"Clonage de '{branch}' avec depth={CLONE_DEPTH}, --no-single-branch...")
     subprocess.run([
         "git", "clone",
         "--depth", str(CLONE_DEPTH),
-        "--no-single-branch",           # Crucial: permet de fetch d'autres branches après
+        "--no-single-branch",
         "-b", branch,
         clone_url, repo_name
     ], check=True)
 
     os.chdir(repo_name)
 
-    # Fetch la branche de base explicitement avec refspec complet
-    logger.info(f"Fetch explicite de origin/{base_ref}...")
+    # === CRITICAL: Élargir le fetch pour inclure toutes les branches (sinon shallow reste limité) ===
+    logger.info("Élargissement du remote fetch refspec à toutes les branches...")
+    subprocess.run([
+        "git", "remote", "set-branches", "origin", "*"
+    ], check=True, capture_output=True)
+
+    # Maintenant fetch la base branch
+    logger.info(f"Fetch de origin/{base_ref} après élargissement refspec...")
     fetch_result = subprocess.run([
         "git", "fetch",
         "origin",
-        f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}",
+        base_ref,                      # Simplifié maintenant que refspec est large
         f"--depth={CLONE_DEPTH}"
     ], capture_output=True, text=True)
 
     if fetch_result.returncode != 0:
-        logger.warning(f"Fetch base branch a échoué: {fetch_result.stderr}")
-    
-    # Deepen légèrement si besoin (merge-base potentiellement loin)
-    subprocess.run(["git", "fetch", "--deepen=150"], check=False, capture_output=True)
+        logger.warning(f"Fetch de base a partiellement échoué: {fetch_result.stderr.strip()}")
+        # Tentative fallback refspec explicite
+        logger.info("Tentative fallback refspec explicite...")
+        subprocess.run([
+            "git", "fetch",
+            "origin",
+            f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}",
+            f"--depth={CLONE_DEPTH}"
+        ], capture_output=True)
+
+    # Deepen un peu plus si divergence ancienne
+    subprocess.run(["git", "fetch", "--deepen=200"], check=False, capture_output=True)
+
+    # Debug rapide post-fetch
+    logger.info("Remote branches après fetch:")
+    logger.info(subprocess.getoutput("git branch -r"))
+
+    logger.info(f"Refs pour {base_ref}:")
+    logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref} || echo 'Pas de ref visible'"))
 
     os.chdir("..")
-    logger.info(f"Clone + fetch terminé : {repo_name}")
+    logger.info(f"Clone + config + fetch terminé : {repo_name}")
     return repo_name
 
 def get_changed_files(repo_path: str, base_ref: str):
@@ -245,3 +266,4 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur globale")
         raise HTTPException(500, detail=f"Server error: {str(e)}")
+
