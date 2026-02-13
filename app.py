@@ -30,14 +30,13 @@ class RefactorRequest(BaseModel):
     branch: str = "auto-refactor"
 
 def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
-    """Clone avec multi-branches + élargissement du refspec pour fetcher la base."""
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     clone_url = repo_url.replace("https://", f"https://{GITHUB_TOKEN}@")
 
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    logger.info(f"Clonage de '{branch}' avec depth={CLONE_DEPTH}, --no-single-branch...")
+    logger.info(f"Clonage shallow de '{branch}' depth={CLONE_DEPTH} --no-single-branch...")
     subprocess.run([
         "git", "clone",
         "--depth", str(CLONE_DEPTH),
@@ -48,44 +47,49 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
 
     os.chdir(repo_name)
 
-    # === CRITICAL: Élargir le fetch pour inclure toutes les branches (sinon shallow reste limité) ===
-    logger.info("Élargissement du remote fetch refspec à toutes les branches...")
-    subprocess.run([
-        "git", "remote", "set-branches", "origin", "*"
-    ], check=True, capture_output=True)
+    # Widen to all branches (you already have this)
+    logger.info("Set remote branches to fetch all (*)...")
+    subprocess.run(["git", "remote", "set-branches", "origin", "*"], check=True, capture_output=True)
 
-    # Maintenant fetch la base branch
-    logger.info(f"Fetch de origin/{base_ref} après élargissement refspec...")
-    fetch_result = subprocess.run([
-        "git", "fetch",
-        "origin",
-        base_ref,                      # Simplifié maintenant que refspec est large
-        f"--depth={CLONE_DEPTH}"
+    # Broad shallow fetch of all branch tips first (helps populate remotes/*)
+    logger.info("Broad fetch --depth to populate remote refs...")
+    broad_fetch = subprocess.run(["git", "fetch", "origin", "--depth=" + str(CLONE_DEPTH)], 
+                                 capture_output=True, text=True)
+    if broad_fetch.returncode != 0:
+        logger.warning(f"Broad fetch warning: {broad_fetch.stderr.strip()}")
+
+    # Explicit fetch for the base branch
+    logger.info(f"Explicit fetch origin {base_ref}...")
+    explicit_fetch = subprocess.run([
+        "git", "fetch", "origin", base_ref, "--depth=" + str(CLONE_DEPTH)
     ], capture_output=True, text=True)
+    if explicit_fetch.returncode != 0:
+        logger.warning(f"Explicit fetch failed: {explicit_fetch.stderr.strip()}")
 
-    if fetch_result.returncode != 0:
-        logger.warning(f"Fetch de base a partiellement échoué: {fetch_result.stderr.strip()}")
-        # Tentative fallback refspec explicite
-        logger.info("Tentative fallback refspec explicite...")
-        subprocess.run([
-            "git", "fetch",
-            "origin",
-            f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}",
-            f"--depth={CLONE_DEPTH}"
-        ], capture_output=True)
+    # Fallback: force create remote-tracking ref from FETCH_HEAD if needed
+    logger.info("Fallback: create remote-tracking ref if missing...")
+    subprocess.run([
+        "git", "update-ref", f"refs/remotes/origin/{base_ref}", "FETCH_HEAD"
+    ], check=False, capture_output=True)
 
-    # Deepen un peu plus si divergence ancienne
-    subprocess.run(["git", "fetch", "--deepen=200"], check=False, capture_output=True)
+    # Deepen history a bit more (helps if merge-base is older than depth)
+    logger.info("Deepening clone...")
+    subprocess.run(["git", "fetch", "--deepen=300"], check=False, capture_output=True)
 
-    # Debug rapide post-fetch
-    logger.info("Remote branches après fetch:")
+    # === DEBUG OUTPUT ===
+    logger.info("=== GIT DEBUG ===")
+    logger.info("Remote branches (git branch -r):")
     logger.info(subprocess.getoutput("git branch -r"))
 
-    logger.info(f"Refs pour {base_ref}:")
-    logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref} || echo 'Pas de ref visible'"))
+    logger.info(f"Refs for {base_ref} (git show-ref | grep {base_ref}):")
+    logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref} || echo 'No refs found'"))
+
+    logger.info("Last 3 commits on HEAD:")
+    logger.info(subprocess.getoutput("git log -n 3 --oneline --decorate"))
+
+    logger.info("=== END DEBUG ===")
 
     os.chdir("..")
-    logger.info(f"Clone + config + fetch terminé : {repo_name}")
     return repo_name
 
 def get_changed_files(repo_path: str, base_ref: str):
@@ -266,4 +270,5 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur globale")
         raise HTTPException(500, detail=f"Server error: {str(e)}")
+
 
