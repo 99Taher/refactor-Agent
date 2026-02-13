@@ -30,7 +30,7 @@ class RefactorRequest(BaseModel):
 
 
 def clone_repo(repo_url, branch):
-    """Clone le dépôt de manière superficielle (un seul commit, une seule branche)."""
+    """Clone le dépôt avec une profondeur de 1 (toutes les branches)."""
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     clone_url = repo_url.replace(
         "https://",
@@ -43,7 +43,6 @@ def clone_repo(repo_url, branch):
     subprocess.run([
         "git", "clone", "-b", branch,
         "--depth", "1",
-        "--single-branch",
         clone_url
     ], check=True)
     return repo_name
@@ -53,13 +52,6 @@ def get_changed_files(repo_path, base_ref):
     """Retourne la liste des fichiers .kt modifiés entre base_ref et HEAD."""
     os.chdir(repo_path)
     try:
-        # Récupérer la branche de base (profondeur 1 pour limiter)
-        subprocess.run(
-            ["git", "fetch", "origin", base_ref, "--depth=1"],
-            check=True,
-            capture_output=True
-        )
-        # Maintenant faire le diff
         cmd = f"git diff --name-only origin/{base_ref}...HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         files = [
