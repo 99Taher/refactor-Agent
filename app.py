@@ -22,7 +22,7 @@ API_SECRET = os.getenv("API_SECRET")
 MAX_FILES = 10
 MAX_WORKERS = 5
 GROQ_TIMEOUT = 30
-CLONE_DEPTH = 100  # Profondeur suffisante pour comparer les branches
+CLONE_DEPTH = 500  # Profondeur augmentée pour capturer plus d'historique
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -41,13 +41,12 @@ def clone_repo(repo_url, branch):
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    # Clone avec profondeur limitée + single-branch pour rapidité
+    # Clone avec profondeur limitée pour rapidité (sans single-branch pour voir les relations entre branches)
     logger.info(f"Clone du repo avec depth={CLONE_DEPTH}...")
     subprocess.run([
         "git", "clone", 
         "-b", branch,
         "--depth", str(CLONE_DEPTH),
-        "--single-branch",
         clone_url
     ], check=True)
     
@@ -80,31 +79,45 @@ def get_changed_files(repo_path, base_ref):
             text=True
         )
 
-        # FIXED: Utiliser FETCH_HEAD au lieu de origin/{base_ref}
-        # FETCH_HEAD est créé automatiquement après le fetch
+        # FIXED: Après le fetch, créer une référence locale explicite
         logger.info("Calcul du diff...")
         
+        # Créer une référence locale pour la branche de base
+        subprocess.run(
+            ["git", "branch", "-f", f"temp-base-{base_ref}", "FETCH_HEAD"],
+            capture_output=True,
+            text=True
+        )
+        
         # Essayer les deux directions pour debug
-        cmd_forward = "git diff --name-only FETCH_HEAD..HEAD"
-        cmd_reverse = "git diff --name-only HEAD..FETCH_HEAD"
+        cmd_forward = f"git diff --name-only temp-base-{base_ref}..HEAD"
+        cmd_reverse = f"git diff --name-only HEAD..temp-base-{base_ref}"
         
-        # Direction 1: Changements dans test (HEAD) par rapport à base (FETCH_HEAD)
-        output_forward = subprocess.check_output(cmd_forward, shell=True, stderr=subprocess.PIPE).decode("utf-8")
-        files_forward = output_forward.splitlines()
-        logger.info(f"[FETCH_HEAD..HEAD] Fichiers trouvés : {len(files_forward)}")
+        # Direction 1: Changements dans test (HEAD) par rapport à base
+        try:
+            output_forward = subprocess.check_output(cmd_forward, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+            files_forward = output_forward.splitlines()
+            logger.info(f"[base..HEAD] Fichiers trouvés : {len(files_forward)}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erreur diff forward: {e.stderr}")
+            files_forward = []
         
-        # Direction 2: Changements dans base (FETCH_HEAD) par rapport à test (HEAD)
-        output_reverse = subprocess.check_output(cmd_reverse, shell=True, stderr=subprocess.PIPE).decode("utf-8")
-        files_reverse = output_reverse.splitlines()
-        logger.info(f"[HEAD..FETCH_HEAD] Fichiers trouvés : {len(files_reverse)}")
+        # Direction 2: Changements dans base par rapport à test
+        try:
+            output_reverse = subprocess.check_output(cmd_reverse, shell=True, stderr=subprocess.PIPE).decode("utf-8")
+            files_reverse = output_reverse.splitlines()
+            logger.info(f"[HEAD..base] Fichiers trouvés : {len(files_reverse)}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erreur diff reverse: {e.stderr}")
+            files_reverse = []
         
         # Utiliser la direction qui a des fichiers
         if len(files_forward) > 0:
             all_files = files_forward
-            logger.info(f"Utilisation de FETCH_HEAD..HEAD (test en avance)")
+            logger.info(f"Utilisation de base..HEAD (test en avance sur base)")
         elif len(files_reverse) > 0:
             all_files = files_reverse
-            logger.info(f"Utilisation de HEAD..FETCH_HEAD (base en avance, test en retard)")
+            logger.info(f"Utilisation de HEAD..base (base en avance sur test)")
         else:
             all_files = []
             logger.info("Aucune différence trouvée dans les deux directions")
