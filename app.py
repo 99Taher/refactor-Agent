@@ -52,18 +52,33 @@ def get_changed_files(repo_path, base_ref):
     """Retourne la liste des fichiers .kt modifiés entre base_ref et HEAD."""
     os.chdir(repo_path)
     try:
+        # Récupérer la branche de base avec profondeur 1
+        logger.info(f"Récupération de la branche de base : origin/{base_ref}")
+        fetch_result = subprocess.run(
+            ["git", "fetch", "origin", base_ref, "--depth=1"],
+            capture_output=True,
+            text=True
+        )
+        if fetch_result.returncode != 0:
+            logger.error(f"Échec du fetch de {base_ref}: {fetch_result.stderr}")
+            # Si le fetch échoue, on ne peut pas comparer, on retourne une liste vide
+            return []
+        else:
+            logger.info(f"Branche {base_ref} récupérée avec succès")
+
+        # Maintenant faire le diff
         cmd = f"git diff --name-only origin/{base_ref}...HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         files = [
             f for f in output.splitlines()
             if f.endswith(".kt") and os.path.exists(f)
         ]
+        return files
     except subprocess.CalledProcessError as e:
-        logger.error(f"Erreur lors de la récupération des fichiers modifiés: {e.stderr.decode() if e.stderr else e}")
-        files = []
+        logger.error(f"Erreur lors du diff: {e.stderr}")
+        return []
     finally:
         os.chdir("..")
-    return files
 
 
 def refactor_file(repo_path, filepath):
@@ -163,7 +178,7 @@ def run_refactor(
         # 1. Clone du dépôt
         repo_path = clone_repo(request.repo_url, request.branch)
 
-        # 2. Récupération des fichiers modifiés
+        # 2. Récupération des fichiers modifiés (avec fetch de la branche de base)
         files = get_changed_files(repo_path, request.base_ref)
         logger.info(f"Fichiers modifiés trouvés : {len(files)}")
 
