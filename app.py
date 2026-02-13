@@ -97,8 +97,9 @@ def refactor_file(repo_path, filepath):
         "   - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
         "Return ONLY raw source code. NO markdown markers, NO explanations."
     )
-   payload = {
-        "model": "llama-3.3-70b-versatile",
+
+    payload = {
+        "model": "mixtral-8x7b-32768",  # ou "llama-3.3-70b-versatile" si vous préférez
         "messages": [
             {"role": "system", "content": "You are a Kotlin expert. Output only raw source code."},
             {"role": "user", "content": f"{prompt}\n\nCODE:\n{code}"}
@@ -182,3 +183,4 @@ def run_refactor(
 
     logger.info("Traitement terminé avec succès")
     return {"processed_files": results}
+
