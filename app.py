@@ -80,7 +80,8 @@ def refactor_file(repo_path, filepath):
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-     prompt = (
+    # Correction : indentation à 4 espaces (au lieu de 5)
+    prompt = (
         "You are a Kotlin Refactoring Expert.\n"
         "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
         "1. CONVERSION RULES:\n"
@@ -183,4 +184,3 @@ def run_refactor(
 
     logger.info("Traitement terminé avec succès")
     return {"processed_files": results}
-
