@@ -92,7 +92,13 @@ def commit_and_push(repo_path):
     subprocess.run(["git", "commit", "-m", "Auto refactor logs"], check=True)
     subprocess.run(["git", "push"], check=True)
     os.chdir("..")
-
+@app.get("/")
+async def root():
+    return {
+        "message": "Refactor Agent API Is Active",
+        "usage": "POST /refactor avec les headers x-api-key et Content-Type",
+        "docs": "/docs"
+    }
 
 @app.post("/refactor")
 def run_refactor(
@@ -118,3 +124,4 @@ def run_refactor(
     commit_and_push(repo_path)
 
     return {"processed_files": results}
+
