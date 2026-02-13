@@ -41,7 +41,7 @@ def clone_repo(repo_url, branch):
     if os.path.exists(repo_name):
         shutil.rmtree(repo_name)
 
-    # Clone avec profondeur limitée pour rapidité (sans single-branch pour voir les relations entre branches)
+    # Clone avec profondeur limitée (sans single-branch pour voir les relations entre branches)
     logger.info(f"Clone du repo avec depth={CLONE_DEPTH}...")
     subprocess.run([
         "git", "clone", 
@@ -79,7 +79,7 @@ def get_changed_files(repo_path, base_ref):
             text=True
         )
 
-        # FIXED: Après le fetch, créer une référence locale explicite
+        # Créer une référence locale explicite pour la branche de base
         logger.info("Calcul du diff...")
         
         # Créer une référence locale pour la branche de base
@@ -124,7 +124,8 @@ def get_changed_files(repo_path, base_ref):
         
         # DEBUG: Afficher TOUS les fichiers trouvés
         logger.info(f"TOUS les fichiers dans le diff choisi : {len(all_files)} fichiers")
-        logger.info(f"Liste complète : {all_files[:20]}")  # Afficher les 20 premiers
+        if len(all_files) > 0:
+            logger.info(f"Liste complète : {all_files[:20]}")  # Afficher les 20 premiers
         
         # Filtrer uniquement les .kt qui existent
         files = [
