@@ -93,56 +93,61 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
     return repo_name
 
 def get_changed_files(repo_path: str, base_ref: str):
-    """Retourne les fichiers .kt modifiés entre base_ref et HEAD (changements du PR)."""
     os.chdir(repo_path)
     try:
-        # === DEBUG: État git ===
-        logger.info("Remote branches disponibles:")
-        logger.info(subprocess.getoutput("git branch -r"))
+        # After all fetches in clone_repo, create a local branch from the fetched base
+        logger.info(f"Creating local tracking branch for base: base-{base_ref}")
+        # Use FETCH_HEAD from last fetch (explicit one should have set it)
+        create_local = subprocess.run([
+            "git", "branch", f"base-{base_ref}", "FETCH_HEAD"
+        ], capture_output=True, text=True)
+        if create_local.returncode != 0:
+            logger.warning(f"Local branch create failed: {create_local.stderr.strip()}")
+            # Fallback: try from origin if exists, or deepen more
+            subprocess.run(["git", "fetch", "--deepen=500"], check=False)
 
-        logger.info("Refs contenant la base branch:")
-        logger.info(subprocess.getoutput(f"git show-ref | grep {base_ref} || echo 'Aucune ref trouvée'"))
+        # DEBUG now
+        logger.info("=== GIT DEBUG AFTER LOCAL BRANCH ===")
+        logger.info("Branches local + remote:")
+        logger.info(subprocess.getoutput("git branch -a"))
 
-        logger.info("Log HEAD (5 derniers commits):")
-        logger.info(subprocess.getoutput("git log -n 5 --oneline --decorate --graph"))
+        logger.info(f"Log of base-{base_ref} (first 3 commits):")
+        logger.info(subprocess.getoutput(f"git log -n 3 --oneline base-{base_ref} || echo 'No log'"))
 
-        # Fetch HEAD aussi au cas où
-        subprocess.run(["git", "fetch", "origin", "HEAD", f"--depth={CLONE_DEPTH}"], check=False)
+        logger.info("Log of HEAD:")
+        logger.info(subprocess.getoutput("git log -n 3 --oneline HEAD"))
 
-        # Préférence : three-dot (changements depuis le point de divergence = ce que GitHub montre dans PR)
-        cmd_three = f"git diff --name-only origin/{base_ref}...HEAD"
-        logger.info(f"Tentative three-dot: {cmd_three}")
+        # Prefer three-dot on local branches
+        cmd_three = f"git diff --name-only base-{base_ref}...HEAD"
+        logger.info(f"Trying three-dot on local: {cmd_three}")
         try:
             output = subprocess.check_output(cmd_three, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
             files = [f.strip() for f in output.splitlines() if f.strip()]
-            logger.info(f"Three-dot → {len(files)} fichiers trouvés")
+            logger.info(f"Local three-dot found {len(files)} files")
         except subprocess.CalledProcessError as e:
-            logger.warning(f"Three-dot échoué: {e.output.decode(errors='ignore')}")
+            logger.warning(f"Three-dot failed: {e.output.decode(errors='ignore')}")
             files = []
 
-        # Fallback : two-dot direct
         if not files:
-            cmd_two = f"git diff --name-only origin/{base_ref}..HEAD"
-            logger.info(f"Fallback two-dot: {cmd_two}")
+            cmd_two = f"git diff --name-only base-{base_ref}..HEAD"
+            logger.info(f"Fallback two-dot local: {cmd_two}")
             try:
                 output = subprocess.check_output(cmd_two, shell=True, stderr=subprocess.STDOUT).decode("utf-8").strip()
                 files = [f.strip() for f in output.splitlines() if f.strip()]
-                logger.info(f"Two-dot → {len(files)} fichiers trouvés")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Two-dot aussi échoué: {e.output.decode(errors='ignore')}")
+                logger.info(f"Local two-dot found {len(files)} files")
+            except:
                 files = []
 
         if files:
-            logger.info(f"Fichiers changés (premiers 10): {files[:10]}")
+            logger.info(f"Changed files sample: {files[:10]}")
 
-        # Filtrer .kt existants
         kt_files = [f for f in files if f.endswith(".kt") and os.path.exists(f)]
-        logger.info(f"Fichiers .kt trouvés : {len(kt_files)} → {kt_files[:5] or 'aucun'}...")
+        logger.info(f".kt files ready for refactor: {len(kt_files)}")
 
         return kt_files
 
     except Exception as e:
-        logger.exception("Erreur inattendue lors du calcul des changements")
+        logger.exception("Diff computation failed")
         return []
     finally:
         os.chdir("..")
@@ -270,5 +275,6 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur globale")
         raise HTTPException(500, detail=f"Server error: {str(e)}")
+
 
 
