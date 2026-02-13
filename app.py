@@ -80,9 +80,10 @@ def get_changed_files(repo_path, base_ref):
             text=True
         )
 
-        # Diff avec double-dot
+        # FIXED: Utiliser FETCH_HEAD au lieu de origin/{base_ref}
+        # FETCH_HEAD est créé automatiquement après le fetch
         logger.info("Calcul du diff...")
-        cmd = f"git diff --name-only origin/{base_ref}..HEAD"
+        cmd = "git diff --name-only FETCH_HEAD..HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         
         files = [
