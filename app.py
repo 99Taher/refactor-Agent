@@ -67,7 +67,7 @@ def get_changed_files(repo_path, base_ref):
             logger.info(f"Branche {base_ref} récupérée avec succès")
 
         # Maintenant faire le diff
-        cmd = f"git diff --name-only origin/{base_ref}...HEAD"
+        cmd = f"git diff --name-only origin/{base_ref}..HEAD"
         output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode("utf-8")
         files = [
             f for f in output.splitlines()
@@ -212,3 +212,4 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur inattendue")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
