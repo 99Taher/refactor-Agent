@@ -1,10 +1,9 @@
 """
-CETTE VERSION A LE FIX SIMPLE APPLIQUÉ:
-- Le deepen est commenté (lignes 95-98)
-- Tout le reste est identique à votre version originale
-
-Cela élimine le timeout de 60s qui causait l'erreur.
-depth=500 est suffisant pour la plupart des cas.
+VERSION FINALE avec:
+1. ✅ Fix timeout deepen (désactivé)
+2. ✅ Gestion erreurs Groq détaillée
+3. ✅ Vérification taille fichiers
+4. ✅ Logs complets avec flush
 """
 
 import os
@@ -37,6 +36,7 @@ MAX_FILES = 10
 MAX_WORKERS = 5
 GROQ_TIMEOUT = 30
 CLONE_DEPTH = 500
+MAX_FILE_SIZE = 100000  # ~100K chars = ~25K tokens (safe pour 32K limit)
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -82,17 +82,11 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
     if fetch_res.returncode != 0:
         logger.warning(f"Fetch refspec échoué : {fetch_res.stderr.strip() or 'code ' + str(fetch_res.returncode)}")
         sys.stdout.flush()
-        # Fallback
         subprocess.run(["git", "update-ref", f"refs/remotes/origin/{base_ref}", "FETCH_HEAD"], check=False)
 
-    # ========== FIX APPLIQUÉ ICI ==========
-    # Deepen commenté pour éviter le timeout
-    # logger.info("Deepen du clone (pour merge-base)")
-    # sys.stdout.flush()
-    # subprocess.run(["git", "fetch", "--deepen=400"], check=False, capture_output=True)
+    # Deepen désactivé pour éviter timeout
     logger.info("Deepen désactivé (depth=500 suffit)")
     sys.stdout.flush()
-    # =======================================
 
     # Debug important
     logger.info("DEBUG CLONE - git branch -r :")
@@ -184,11 +178,22 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         with open(full_path, "r", encoding="utf-8") as f:
             code = f.read()
 
+        # Vérifier si le fichier contient des logs à refactoriser
         if not any(x in code for x in ["Log.", "Logr.", "AppSTLogger.", "AppLogger."]):
             return f"{filepath} - pas de logs"
 
+        # Vérifier la taille du fichier
+        file_size = len(code)
+        if file_size > MAX_FILE_SIZE:
+            logger.warning(f"⚠️  {filepath} trop gros ({file_size:,} chars > {MAX_FILE_SIZE:,}), ignoré")
+            sys.stdout.flush()
+            return f"{filepath} → trop gros ({file_size:,} chars)"
+
         url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}", 
+            "Content-Type": "application/json"
+        }
 
         prompt = (
             "You are a Kotlin Refactoring Expert.\n"
@@ -217,22 +222,42 @@ def refactor_file(repo_path: str, filepath: str) -> str:
             "temperature": 0
         }
 
+        logger.info(f"🤖 Refactoring {filepath} ({file_size:,} chars)...")
+        sys.stdout.flush()
+        
         resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
-        resp.raise_for_status()
+        
+        # Gestion détaillée des erreurs
+        if resp.status_code != 200:
+            logger.error(f"❌ Groq API Error {resp.status_code} pour {filepath}")
+            try:
+                error_data = resp.json()
+                error_msg = error_data.get('error', {}).get('message', resp.text[:200])
+                logger.error(f"   Message: {error_msg}")
+            except:
+                logger.error(f"   Response: {resp.text[:500]}")
+            sys.stdout.flush()
+            return f"{filepath} → Groq error {resp.status_code}"
 
         new_code = resp.json()["choices"][0]["message"]["content"].strip()
+        
+        # Nettoyer les marqueurs markdown si présents
         new_code = re.sub(r'^```kotlin\s*', '', new_code, flags=re.M)
         new_code = re.sub(r'^\s*```$', '', new_code, flags=re.M)
 
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(new_code)
 
+        logger.info(f"✅ {filepath} refactorisé")
+        sys.stdout.flush()
         return f"{filepath} → refactored"
 
     except requests.exceptions.Timeout:
+        logger.error(f"⏱️  Timeout Groq pour {filepath}")
+        sys.stdout.flush()
         return f"{filepath} → timeout Groq"
     except Exception as e:
-        logger.error(f"Erreur refactor {filepath}: {e}")
+        logger.error(f"❌ Erreur refactor {filepath}: {e}")
         sys.stdout.flush()
         return f"{filepath} → erreur"
 
@@ -261,7 +286,30 @@ def commit_and_push(repo_path: str):
 
 @app.get("/")
 async def root():
-    return {"message": "Refactor Agent API Active - DEEPEN DISABLED"}
+    return {
+        "message": "Refactor Agent API Active",
+        "version": "3.0-final",
+        "config": {
+            "max_file_size": f"{MAX_FILE_SIZE:,} chars",
+            "deepen": "disabled"
+        }
+    }
+
+
+@app.get("/health")
+async def health():
+    missing = []
+    if not GROQ_API_KEY:
+        missing.append("GROQ_API_KEY")
+    if not GITHUB_TOKEN:
+        missing.append("GITHUB_TOKEN")
+    if not API_SECRET:
+        missing.append("API_SECRET")
+    
+    if missing:
+        return {"status": "unhealthy", "missing_env": missing}
+    
+    return {"status": "healthy"}
 
 
 @app.post("/refactor")
