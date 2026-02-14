@@ -1,11 +1,12 @@
 """
-VERSION FINALE v5 avec:
+VERSION FINALE v6 avec:
 1. ✅ Fix timeout deepen (désactivé)
 2. ✅ Gestion erreurs Groq détaillée
 3. ✅ Vérification taille fichiers (50K max)
 4. ✅ Modèle Groq mis à jour (llama-3.3-70b-versatile)
 5. ✅ MAX_WORKERS réduit à 2 (évite rate limits)
 6. ✅ Debug git status (comprendre commits vides)
+7. ✅ Configuration Git identity (FIX COMMIT)
 """
 
 import os
@@ -33,6 +34,10 @@ app = FastAPI()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
+
+# Configuration Git (configurable via env)
+GIT_USER_EMAIL = os.getenv("GIT_USER_EMAIL", "bot@refactor-agent.local")
+GIT_USER_NAME = os.getenv("GIT_USER_NAME", "Refactor Agent Bot")
 
 MAX_FILES = 10
 MAX_WORKERS = 2  # Réduit de 5 à 2 pour éviter rate limits Groq gratuit
@@ -264,6 +269,21 @@ def refactor_file(repo_path: str, filepath: str) -> str:
 def commit_and_push(repo_path: str):
     os.chdir(repo_path)
     try:
+        # 🔧 FIX: Configuration Git identity pour ce repository
+        logger.info(f"🔧 Configuration Git identity: {GIT_USER_NAME} <{GIT_USER_EMAIL}>")
+        sys.stdout.flush()
+        
+        subprocess.run(
+            ["git", "config", "user.email", GIT_USER_EMAIL],
+            check=True,
+            capture_output=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", GIT_USER_NAME],
+            check=True,
+            capture_output=True
+        )
+        
         # Debug: voir le statut git avant commit
         logger.info("🔍 Git status avant commit:")
         sys.stdout.flush()
@@ -280,20 +300,29 @@ def commit_and_push(repo_path: str):
         logger.info(staged_output if staged_output else "  <rien à commiter>")
         sys.stdout.flush()
         
+        # Commit sans --allow-empty (seulement si changements réels)
         commit_res = subprocess.run(
-            ["git", "commit", "-m", "🤖 Auto refactor logs", "--allow-empty"],
+            ["git", "commit", "-m", "🤖 Auto refactor logs"],
             capture_output=True, text=True
         )
+        
         if commit_res.returncode == 0:
-            subprocess.run(["git", "push"], check=True)
-            logger.info("✅ Commit & push OK")
+            logger.info("✅ Commit créé, push en cours...")
             sys.stdout.flush()
+            push_res = subprocess.run(["git", "push"], capture_output=True, text=True)
+            if push_res.returncode == 0:
+                logger.info("✅ Push réussi!")
+                sys.stdout.flush()
+            else:
+                logger.error(f"❌ Push échoué: {push_res.stderr.strip()}")
+                sys.stdout.flush()
         else:
-            logger.warning("⚠️  Commit vide ou déjà fait → skip push")
-            logger.warning(f"   Git commit output: {commit_res.stdout.strip() or commit_res.stderr.strip()}")
+            logger.warning("⚠️  Rien à commiter (changements déjà commitéss ou aucun changement)")
+            logger.info(f"   Git output: {commit_res.stdout.strip() or commit_res.stderr.strip()}")
             sys.stdout.flush()
+            
     except Exception as e:
-        logger.warning(f"⚠️  Problème commit/push : {e}")
+        logger.error(f"❌ Erreur commit/push : {e}")
         sys.stdout.flush()
     finally:
         os.chdir("..")
@@ -303,11 +332,12 @@ def commit_and_push(repo_path: str):
 async def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "5.0-production-ready",
+        "version": "6.0-git-identity-fixed",
         "config": {
             "groq_model": GROQ_MODEL,
             "max_file_size": f"{MAX_FILE_SIZE:,} chars",
-            "deepen": "disabled"
+            "deepen": "disabled",
+            "git_user": f"{GIT_USER_NAME} <{GIT_USER_EMAIL}>"
         }
     }
 
@@ -327,7 +357,8 @@ async def health():
     
     return {
         "status": "healthy",
-        "groq_model": GROQ_MODEL
+        "groq_model": GROQ_MODEL,
+        "git_identity": f"{GIT_USER_NAME} <{GIT_USER_EMAIL}>"
     }
 
 
