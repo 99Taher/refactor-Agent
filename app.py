@@ -27,6 +27,7 @@ class RefactorRequest(BaseModel):
     repo_url: str
     base_ref: str = "main"
     branch: str = "auto-refactor"
+    
 
 
 def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
@@ -263,3 +264,4 @@ def run_refactor(
     except Exception as e:
         logger.exception("Erreur générale")
         raise HTTPException(500, str(e))
+
