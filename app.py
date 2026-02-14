@@ -4,6 +4,7 @@ VERSION FINALE avec:
 2. ✅ Gestion erreurs Groq détaillée
 3. ✅ Vérification taille fichiers
 4. ✅ Logs complets avec flush
+
 """
 
 import os
@@ -357,3 +358,4 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
+
