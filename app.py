@@ -1,10 +1,11 @@
 """
-VERSION FINALE avec:
+VERSION FINALE v5 avec:
 1. ✅ Fix timeout deepen (désactivé)
 2. ✅ Gestion erreurs Groq détaillée
-3. ✅ Vérification taille fichiers
-4. ✅ Logs complets avec flush
-
+3. ✅ Vérification taille fichiers (50K max)
+4. ✅ Modèle Groq mis à jour (llama-3.3-70b-versatile)
+5. ✅ MAX_WORKERS réduit à 2 (évite rate limits)
+6. ✅ Debug git status (comprendre commits vides)
 """
 
 import os
@@ -34,10 +35,13 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
 
 MAX_FILES = 10
-MAX_WORKERS = 5
+MAX_WORKERS = 2  # Réduit de 5 à 2 pour éviter rate limits Groq gratuit
 GROQ_TIMEOUT = 30
 CLONE_DEPTH = 500
-MAX_FILE_SIZE = 100000  # ~100K chars = ~25K tokens (safe pour 32K limit)
+MAX_FILE_SIZE = 50000  # Réduit de 100K à 50K pour éviter erreurs 413 (~12K tokens)
+
+# Modèle Groq (configurable via env, défaut: llama-3.3-70b-versatile)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -85,11 +89,9 @@ def clone_repo(repo_url: str, branch: str, base_ref: str) -> str:
         sys.stdout.flush()
         subprocess.run(["git", "update-ref", f"refs/remotes/origin/{base_ref}", "FETCH_HEAD"], check=False)
 
-    # Deepen désactivé pour éviter timeout
     logger.info("Deepen désactivé (depth=500 suffit)")
     sys.stdout.flush()
 
-    # Debug important
     logger.info("DEBUG CLONE - git branch -r :")
     sys.stdout.flush()
     logger.info(subprocess.getoutput("git branch -r") or "<vide>")
@@ -179,11 +181,9 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         with open(full_path, "r", encoding="utf-8") as f:
             code = f.read()
 
-        # Vérifier si le fichier contient des logs à refactoriser
         if not any(x in code for x in ["Log.", "Logr.", "AppSTLogger.", "AppLogger."]):
             return f"{filepath} - pas de logs"
 
-        # Vérifier la taille du fichier
         file_size = len(code)
         if file_size > MAX_FILE_SIZE:
             logger.warning(f"⚠️  {filepath} trop gros ({file_size:,} chars > {MAX_FILE_SIZE:,}), ignoré")
@@ -215,7 +215,7 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         )
 
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": GROQ_MODEL,
             "messages": [
                 {"role": "system", "content": "You are a Kotlin expert. Output only raw source code."},
                 {"role": "user", "content": f"{prompt}\n\nCODE:\n{code}"}
@@ -223,12 +223,11 @@ def refactor_file(repo_path: str, filepath: str) -> str:
             "temperature": 0
         }
 
-        logger.info(f"🤖 Refactoring {filepath} ({file_size:,} chars)...")
+        logger.info(f"🤖 Refactoring {filepath} ({file_size:,} chars) avec {GROQ_MODEL}...")
         sys.stdout.flush()
         
         resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
         
-        # Gestion détaillée des erreurs
         if resp.status_code != 200:
             logger.error(f"❌ Groq API Error {resp.status_code} pour {filepath}")
             try:
@@ -242,7 +241,6 @@ def refactor_file(repo_path: str, filepath: str) -> str:
 
         new_code = resp.json()["choices"][0]["message"]["content"].strip()
         
-        # Nettoyer les marqueurs markdown si présents
         new_code = re.sub(r'^```kotlin\s*', '', new_code, flags=re.M)
         new_code = re.sub(r'^\s*```$', '', new_code, flags=re.M)
 
@@ -266,20 +264,36 @@ def refactor_file(repo_path: str, filepath: str) -> str:
 def commit_and_push(repo_path: str):
     os.chdir(repo_path)
     try:
+        # Debug: voir le statut git avant commit
+        logger.info("🔍 Git status avant commit:")
+        sys.stdout.flush()
+        status_output = subprocess.getoutput("git status --short")
+        logger.info(status_output if status_output else "  <aucun changement détecté>")
+        sys.stdout.flush()
+        
         subprocess.run(["git", "add", "."], check=True)
+        
+        # Debug: voir le statut après git add
+        logger.info("🔍 Git status après git add:")
+        sys.stdout.flush()
+        staged_output = subprocess.getoutput("git diff --cached --name-only")
+        logger.info(staged_output if staged_output else "  <rien à commiter>")
+        sys.stdout.flush()
+        
         commit_res = subprocess.run(
             ["git", "commit", "-m", "🤖 Auto refactor logs", "--allow-empty"],
             capture_output=True, text=True
         )
         if commit_res.returncode == 0:
             subprocess.run(["git", "push"], check=True)
-            logger.info("Commit & push OK")
+            logger.info("✅ Commit & push OK")
             sys.stdout.flush()
         else:
-            logger.info("Commit vide ou déjà fait → skip push")
+            logger.warning("⚠️  Commit vide ou déjà fait → skip push")
+            logger.warning(f"   Git commit output: {commit_res.stdout.strip() or commit_res.stderr.strip()}")
             sys.stdout.flush()
     except Exception as e:
-        logger.warning(f"Problème commit/push : {e}")
+        logger.warning(f"⚠️  Problème commit/push : {e}")
         sys.stdout.flush()
     finally:
         os.chdir("..")
@@ -289,8 +303,9 @@ def commit_and_push(repo_path: str):
 async def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "3.0-final",
+        "version": "5.0-production-ready",
         "config": {
+            "groq_model": GROQ_MODEL,
             "max_file_size": f"{MAX_FILE_SIZE:,} chars",
             "deepen": "disabled"
         }
@@ -310,7 +325,10 @@ async def health():
     if missing:
         return {"status": "unhealthy", "missing_env": missing}
     
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "groq_model": GROQ_MODEL
+    }
 
 
 @app.post("/refactor")
@@ -358,5 +376,3 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
-
-
