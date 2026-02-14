@@ -215,7 +215,7 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         )
 
         payload = {
-            "model": "mixtral-8x7b-32768",
+            "model": "llama-3.3-70b-versatile",
             "messages": [
                 {"role": "system", "content": "You are a Kotlin expert. Output only raw source code."},
                 {"role": "user", "content": f"{prompt}\n\nCODE:\n{code}"}
@@ -358,4 +358,5 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
+
 
