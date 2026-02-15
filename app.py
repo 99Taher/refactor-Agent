@@ -1,25 +1,23 @@
 """
-VERSION v6 - OPTIMISÉE PLAN GRATUIT GROQ
-Changements vs v5:
-1. MAX_WORKERS = 1 (séquentiel, pas de parallèle)
-2. Délai de 2s entre chaque fichier
-3. Retry automatique sur 429 (3 tentatives)
-4. Consommation: ~6-8K tokens/min (bien sous les 12K)
-→ ZÉRO rate limit même avec runs rapprochés
+VERSION FINALE v5 avec:
+1. ✅ Fix timeout deepen (désactivé)
+2. ✅ Gestion erreurs Groq détaillée
+3. ✅ Vérification taille fichiers (50K max)
+4. ✅ Modèle Groq mis à jour (llama-3.3-70b-versatile)
+5. ✅ MAX_WORKERS réduit à 2 (évite rate limits)
+6. ✅ Debug git status (comprendre commits vides)
 """
 
 import os
 import re
 import shutil
 import sys
-import time
 import requests
 import subprocess
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
-
 
 # Logging avec flush
 logging.basicConfig(
@@ -36,15 +34,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
 
-# ⭐ OPTIMISATIONS PLAN GRATUIT
 MAX_FILES = 10
-MAX_WORKERS = 1  # Un fichier à la fois (évite rate limits)
+MAX_WORKERS = 2  # Réduit de 5 à 2 pour éviter rate limits Groq gratuit
 GROQ_TIMEOUT = 30
 CLONE_DEPTH = 500
-MAX_FILE_SIZE = 50000  # ~12K tokens max
-REQUEST_DELAY = 2  # 2 secondes entre chaque requête
-MAX_RETRIES = 3  # Nombre de tentatives sur 429
+MAX_FILE_SIZE = 50000  # Réduit de 100K à 50K pour éviter erreurs 413 (~12K tokens)
 
+# Modèle Groq (configurable via env, défaut: llama-3.3-70b-versatile)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 class RefactorRequest(BaseModel):
@@ -180,9 +176,7 @@ def get_changed_files(repo_path: str, base_ref: str):
 
 
 def refactor_file(repo_path: str, filepath: str) -> str:
-    """Refactorise un fichier avec retry automatique sur rate limit."""
     full_path = os.path.join(repo_path, filepath)
-    
     try:
         with open(full_path, "r", encoding="utf-8") as f:
             code = f.read()
@@ -232,59 +226,35 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         logger.info(f"🤖 Refactoring {filepath} ({file_size:,} chars) avec {GROQ_MODEL}...")
         sys.stdout.flush()
         
-        # ⭐ RETRY LOGIC pour gérer les 429
-        for attempt in range(1, MAX_RETRIES + 1):
+        resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
+        
+        if resp.status_code != 200:
+            logger.error(f"❌ Groq API Error {resp.status_code} pour {filepath}")
             try:
-                resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
-                
-                # Si rate limit (429), attendre et réessayer
-                if resp.status_code == 429:
-                    if attempt < MAX_RETRIES:
-                        error_data = resp.json()
-                        wait_time = 10  # Attendre 10s par défaut
-                        logger.warning(f"⏳ Rate limit (429) - tentative {attempt}/{MAX_RETRIES}, attente {wait_time}s...")
-                        sys.stdout.flush()
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(f"❌ Rate limit persistant après {MAX_RETRIES} tentatives")
-                        sys.stdout.flush()
-                        return f"{filepath} → rate limit (max retries)"
-                
-                # Autres erreurs
-                if resp.status_code != 200:
-                    logger.error(f"❌ Groq API Error {resp.status_code} pour {filepath}")
-                    try:
-                        error_data = resp.json()
-                        error_msg = error_data.get('error', {}).get('message', resp.text[:200])
-                        logger.error(f"   Message: {error_msg}")
-                    except:
-                        logger.error(f"   Response: {resp.text[:500]}")
-                    sys.stdout.flush()
-                    return f"{filepath} → Groq error {resp.status_code}"
+                error_data = resp.json()
+                error_msg = error_data.get('error', {}).get('message', resp.text[:200])
+                logger.error(f"   Message: {error_msg}")
+            except:
+                logger.error(f"   Response: {resp.text[:500]}")
+            sys.stdout.flush()
+            return f"{filepath} → Groq error {resp.status_code}"
 
-                # Succès !
-                new_code = resp.json()["choices"][0]["message"]["content"].strip()
-                
-                new_code = re.sub(r'^```kotlin\s*', '', new_code, flags=re.M)
-                new_code = re.sub(r'^\s*```$', '', new_code, flags=re.M)
+        new_code = resp.json()["choices"][0]["message"]["content"].strip()
+        
+        new_code = re.sub(r'^```kotlin\s*', '', new_code, flags=re.M)
+        new_code = re.sub(r'^\s*```$', '', new_code, flags=re.M)
 
-                with open(full_path, "w", encoding="utf-8") as f:
-                    f.write(new_code)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
 
-                logger.info(f"✅ {filepath} refactorisé")
-                sys.stdout.flush()
-                
-                # ⭐ DÉLAI entre requêtes (évite rate limits)
-                time.sleep(REQUEST_DELAY)
-                
-                return f"{filepath} → refactored"
-                
-            except requests.exceptions.Timeout:
-                logger.error(f"⏱️  Timeout Groq pour {filepath}")
-                sys.stdout.flush()
-                return f"{filepath} → timeout Groq"
+        logger.info(f"✅ {filepath} refactorisé")
+        sys.stdout.flush()
+        return f"{filepath} → refactored"
 
+    except requests.exceptions.Timeout:
+        logger.error(f"⏱️  Timeout Groq pour {filepath}")
+        sys.stdout.flush()
+        return f"{filepath} → timeout Groq"
     except Exception as e:
         logger.error(f"❌ Erreur refactor {filepath}: {e}")
         sys.stdout.flush()
@@ -294,12 +264,6 @@ def refactor_file(repo_path: str, filepath: str) -> str:
 def commit_and_push(repo_path: str):
     os.chdir(repo_path)
     try:
-        # Configuration Git identity
-        logger.info("🔧 Configuration Git identity: Refactor Agent Bot <bot@refactor-agent.local>")
-        sys.stdout.flush()
-        subprocess.run(["git", "config", "user.name", "Refactor Agent Bot"], check=True)
-        subprocess.run(["git", "config", "user.email", "bot@refactor-agent.local"], check=True)
-        
         # Debug: voir le statut git avant commit
         logger.info("🔍 Git status avant commit:")
         sys.stdout.flush()
@@ -321,10 +285,8 @@ def commit_and_push(repo_path: str):
             capture_output=True, text=True
         )
         if commit_res.returncode == 0:
-            logger.info("✅ Commit créé, push en cours...")
-            sys.stdout.flush()
             subprocess.run(["git", "push"], check=True)
-            logger.info("✅ Push réussi!")
+            logger.info("✅ Commit & push OK")
             sys.stdout.flush()
         else:
             logger.warning("⚠️  Commit vide ou déjà fait → skip push")
@@ -341,13 +303,10 @@ def commit_and_push(repo_path: str):
 async def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "6.0-free-tier-optimized",
+        "version": "5.0-production-ready",
         "config": {
             "groq_model": GROQ_MODEL,
             "max_file_size": f"{MAX_FILE_SIZE:,} chars",
-            "max_workers": MAX_WORKERS,
-            "request_delay": f"{REQUEST_DELAY}s",
-            "max_retries": MAX_RETRIES,
             "deepen": "disabled"
         }
     }
@@ -368,8 +327,7 @@ async def health():
     
     return {
         "status": "healthy",
-        "groq_model": GROQ_MODEL,
-        "optimized_for": "free_tier"
+        "groq_model": GROQ_MODEL
     }
 
 
@@ -395,12 +353,8 @@ def run_refactor(
             return {"status": "ok", "message": "Aucun .kt modifié détecté"}
 
         files = files[:MAX_FILES] if len(files) > MAX_FILES else files
-        
-        logger.info(f"📝 Traitement séquentiel de {len(files)} fichiers (plan gratuit optimisé)")
-        sys.stdout.flush()
 
         results = []
-        # Avec MAX_WORKERS=1, c'est séquentiel mais on garde ThreadPoolExecutor pour la cohérence
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(refactor_file, repo_path, f): f for f in files}
             for future in as_completed(futures):
@@ -422,4 +376,3 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
-
