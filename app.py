@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
+
 # Logging avec flush
 logging.basicConfig(
     level=logging.INFO,
@@ -421,3 +422,4 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
+
