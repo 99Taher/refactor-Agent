@@ -199,22 +199,41 @@ def refactor_file(repo_path: str, filepath: str) -> str:
         }
 
         prompt = (
-            "You are a Kotlin Refactoring Expert.\n"
-            "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
-            "1. CONVERSION RULES:\n"
-            " - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg) -> AppLogger.i(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg) -> AppLogger.w(tag, msg)\n"
-            " - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
-            "2. DEDUPLICATION RULE (CRITICAL):\n"
-            " - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
-            " - Example: Multiple AppLogger.e(MODULE, 'text') calls become just one.\n\n"
-            "3. IMPORTS:\n"
-            " - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
-            " - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
-            "Return ONLY raw source code. NO markdown markers, NO explanations."
-        )
+    "You are a Kotlin Refactoring Expert.\n"
+    "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
+
+    "🚨 CRITICAL CONSTRAINT:\n"
+    " - DO NOT modify business logic.\n"
+    " - DO NOT change control flow (if, when, for, while, try/catch).\n"
+    " - DO NOT modify variable names.\n"
+    " - DO NOT modify function signatures.\n"
+    " - DO NOT add or remove methods.\n"
+    " - DO NOT change return values.\n"
+    " - DO NOT optimize code.\n"
+    " - ONLY refactor logging statements.\n\n"
+
+    "1. CONVERSION RULES:\n"
+    " - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
+    " - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
+    " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg) -> AppLogger.i(tag, msg)\n"
+    " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg) -> AppLogger.w(tag, msg)\n"
+    " - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
+
+    "2. DEDUPLICATION RULE (CRITICAL):\n"
+    " - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
+    " - Only merge if they are strictly identical and consecutive.\n\n"
+
+    "3. IMPORTS:\n"
+    " - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
+    " - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n"
+    " - Do not modify any other imports.\n\n"
+
+    "Return ONLY raw source code.\n"
+    "NO markdown.\n"
+    "NO explanations.\n"
+    "NO comments added.\n"
+    "Preserve formatting and indentation."
+)
 
         payload = {
             "model": GROQ_MODEL,
@@ -416,4 +435,5 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
+
 
