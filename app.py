@@ -106,19 +106,29 @@ def clone_repo(repo_url: str, branch: str) -> Path:
 
 def get_changed_files(repo_path: Path, base_ref: str):
     logger.info("Detecting changed files...")
-    run_git(["git", "fetch", "origin", base_ref], cwd=repo_path)
+    
+    # Fetch all branches et tags
+    run_git(["git", "fetch", "--all"], cwd=repo_path)
+    
+    # Vérifier si la branche existe côté origin
+    branches = run_git(["git", "branch", "-r"], cwd=repo_path).splitlines()
+    origin_branch = f"origin/{base_ref}"
+    if origin_branch not in branches:
+        logger.warning(f"⚠️ Branch {origin_branch} not found, fallback to FETCH_HEAD")
+        base_ref_for_diff = "FETCH_HEAD"
+    else:
+        base_ref_for_diff = origin_branch
 
-    diff = run_git(
-        ["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"],
-        cwd=repo_path
-    )
-
-    files = [
-        f for f in diff.splitlines()
-        if f.endswith(".kt")
-    ]
-
-    return files[:MAX_FILES]
+    try:
+        diff = run_git(
+            ["git", "diff", "--name-only", f"{base_ref_for_diff}...HEAD", "--"],
+            cwd=repo_path
+        )
+        files = [f for f in diff.splitlines() if f.endswith(".kt")]
+        return files[:MAX_FILES]
+    except Exception as e:
+        logger.error(f"Erreur git diff: {e}")
+        return []
 
 
 # ================= GROQ =================
@@ -287,6 +297,7 @@ def health():
         "max_workers": MAX_WORKERS,
         "request_delay": REQUEST_DELAY
     }
+
 
 
 
