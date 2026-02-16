@@ -41,7 +41,7 @@ MAX_FILE_SIZE = 50000
 REQUEST_DELAY = 2  # ⭐ 2s entre chaque fichier
 MAX_RETRIES = 3
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 class RefactorRequest(BaseModel):
     repo_url: str
@@ -416,3 +416,4 @@ def run_refactor(
         logger.exception("Erreur générale")
         sys.stdout.flush()
         raise HTTPException(500, str(e))
+
