@@ -7,7 +7,7 @@ import logging
 import requests
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -25,7 +25,11 @@ MAX_FILE_SIZE         = 40000
 MAX_TOKENS_OUT        = 32000
 RATE_LIMIT_BASE_WAIT  = 15
 MIN_CHUNK_SIZE_FOR_CHECKS = 100
-NON_LOG_LINE_LOSS_MAX = 2
+
+# Tolérance : nb max de lignes non-log MODIFIÉES (ajoutées OU supprimées) par chunk
+NON_LOG_DIFF_MAX_PER_CHUNK = 3
+# Tolérance : nb max de lignes non-log MODIFIÉES sur tout le fichier
+NON_LOG_DIFF_MAX_FINAL     = 5
 
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -97,11 +101,7 @@ def clone_repo(repo_url: str, branch: str) -> Path:
 
 def _try_diff(repo_path: Path, base: str, dot: str) -> Optional[str]:
     try:
-        result = run_git(
-            ["git", "diff", "--name-only", f"{base}{dot}HEAD", "--"],
-            cwd=repo_path
-        )
-        return result
+        return run_git(["git", "diff", "--name-only", f"{base}{dot}HEAD", "--"], cwd=repo_path)
     except Exception as e:
         logger.warning(f"  git diff {dot} échoué: {e}")
         return None
@@ -139,17 +139,13 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
     if diff is None:
         logger.warning("⚠️ Three-dot échoué — essai two-dot...")
         diff = _try_diff(repo_path, base_ref_for_diff, "..")
-
-    # Fallback : deepen + retry
     if diff is None:
         logger.warning("⚠️ Two-dot échoué — deepen 500...")
         try:
             run_git(["git", "fetch", "--deepen=500", "origin", base_ref], cwd=repo_path, check=False)
         except Exception:
             pass
-        diff = _try_diff(repo_path, base_ref_for_diff, "...")
-        if diff is None:
-            diff = _try_diff(repo_path, base_ref_for_diff, "..")
+        diff = _try_diff(repo_path, base_ref_for_diff, "...") or _try_diff(repo_path, base_ref_for_diff, "..")
 
     if not diff:
         logger.info("Aucun fichier .kt modifié trouvé")
@@ -167,20 +163,15 @@ LOG_PATTERNS = re.compile(
 IMPORT_PATTERNS = re.compile(
     r"^import\s+(android\.util\.Log|com\.honeywell.*[Ll]og|com\.st.*[Ll]og|.*Logr|.*STLevelLog|.*AppLogger|.*AppSTLogger)"
 )
-
-# ⭐ Patterns de troncature plus stricts : uniquement des lignes qui ne sont QUE "..."
-# Évite les faux positifs sur du code Kotlin légitime contenant "..."
 TRUNCATION_PATTERNS = re.compile(
-    r"(^\s*//\s*\.\.\.\s*$"           # // ...
-    r"|^\s*/\*\s*\.\.\.\s*\*/\s*$"    # /* ... */
-    r"|^\s*\.\.\.\s*$"                # ...  (seul sur la ligne)
+    r"(^\s*//\s*\.\.\.\s*$"
+    r"|^\s*/\*\s*\.\.\.\s*\*/\s*$"
+    r"|^\s*\.\.\.\s*$"
     r"|^\s*//\s*rest of (the )?code\s*$"
     r"|^\s*//\s*\[truncated\]\s*$"
     r")",
     re.IGNORECASE | re.MULTILINE
 )
-
-# ⭐ Filet de sécurité Python pour doublons inter-chunks
 APPLOGGER_LINE = re.compile(r"^\s*AppLogger\.[diwev]\(.*\)\s*$")
 
 
@@ -193,12 +184,25 @@ def detect_truncation(code: str) -> bool:
     return bool(TRUNCATION_PATTERNS.search(code))
 
 
-def deduplicate_applogger(code: str) -> int:
+def get_non_log_lines(code: str) -> List[str]:
+    """Retourne les lignes non-log non-vides, strippées."""
+    return [l.strip() for l in code.splitlines() if l.strip() and not is_log_related(l)]
+
+
+def diff_non_log(original: str, refactored: str) -> Tuple[List[str], List[str]]:
     """
-    Supprime les doublons consécutifs AppLogger identiques (filet inter-chunks).
-    Retourne le nombre de lignes supprimées.
-    Modifie le fichier in-place via retour de la nouvelle chaîne.
+    ⭐ Comparaison par SET de contenu — pas par count.
+    Retourne (lignes_supprimées, lignes_ajoutées).
     """
+    orig_set = set(get_non_log_lines(original))
+    new_set  = set(get_non_log_lines(refactored))
+    removed  = sorted(orig_set - new_set)
+    added    = sorted(new_set  - orig_set)
+    return removed, added
+
+
+def deduplicate_applogger(code: str) -> Tuple[str, int]:
+    """Filet de sécurité Python : doublons AppLogger consécutifs inter-chunks."""
     lines = code.splitlines(keepends=True)
     result = []
     removed = 0
@@ -218,36 +222,64 @@ def deduplicate_applogger(code: str) -> int:
     return "".join(result), removed
 
 
-def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -> tuple[bool, str]:
-    orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
-    new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
+# ================= VALIDATION =================
+def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -> Tuple[bool, str]:
+    """
+    ⭐ Validation par SET : compte les lignes non-log réellement supprimées ou ajoutées.
+    Une perte de count peut masquer des modifications réelles (ajout + suppression simultanés).
+    """
+    removed, added = diff_non_log(original, refactored)
 
-    orig_log  = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
-    new_log   = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
-    loss      = len(orig_non_log) - len(new_non_log)
+    orig_log = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
+    new_log  = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
 
     logger.info(
         f"  📊 Chunk {chunk_index}: "
-        f"non-log {len(orig_non_log)}→{len(new_non_log)} (perte: {loss}) | "
+        f"non-log Δ={len(removed)} supprimées / {len(added)} ajoutées | "
         f"log {orig_log}→{new_log} (dedup LLM: {orig_log - new_log})"
     )
 
-    if loss <= NON_LOG_LINE_LOSS_MAX:
+    total_diff = len(removed) + len(added)
+    if total_diff <= NON_LOG_DIFF_MAX_PER_CHUNK:
+        if removed or added:
+            for l in removed[:2]: logger.warning(f"    - '{l[:80]}'")
+            for l in added[:2]:   logger.warning(f"    + '{l[:80]}'")
         return True, "ok"
 
-    # Afficher les lignes perdues pour debug
-    orig_set = set(orig_non_log)
-    new_set  = set(new_non_log)
-    for line in list(orig_set - new_set)[:3]:
-        logger.error(f"    - '{line[:80]}'")
-    return False, f"perte de {loss} lignes non-log (max={NON_LOG_LINE_LOSS_MAX})"
+    for l in removed[:3]: logger.error(f"    - '{l[:80]}'")
+    for l in added[:3]:   logger.error(f"    + '{l[:80]}'")
+    return False, f"Δ non-log = {len(removed)} supprimées + {len(added)} ajoutées (max={NON_LOG_DIFF_MAX_PER_CHUNK})"
+
+
+def validate_refactoring(original: str, refactored: str, filepath: str) -> Tuple[bool, str]:
+    """Validation finale par SET sur le fichier complet assemblé."""
+    removed, added = diff_non_log(original, refactored)
+    total_diff = len(removed) + len(added)
+
+    orig_log = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
+    new_log  = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
+
+    logger.info(
+        f"  🔍 Validation finale: Δ non-log = {len(removed)} supprimées / {len(added)} ajoutées | "
+        f"log {orig_log}→{new_log} (dedup total: {orig_log - new_log})"
+    )
+
+    if total_diff <= NON_LOG_DIFF_MAX_FINAL:
+        if removed or added:
+            for l in removed[:3]: logger.warning(f"    - '{l[:80]}'")
+            for l in added[:3]:   logger.warning(f"    + '{l[:80]}'")
+        return True, "ok"
+
+    for l in removed[:5]: logger.error(f"    - '{l[:80]}'")
+    for l in added[:5]:   logger.error(f"    + '{l[:80]}'")
+    return False, f"Δ non-log = {len(removed)} supprimées + {len(added)} ajoutées (max={NON_LOG_DIFF_MAX_FINAL})"
 
 
 # ================= GROQ =================
 def build_prompt(is_retry: bool = False) -> str:
     retry_prefix = (
-        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED because you removed non-log source lines.\n"
-        "THIS TIME: output every single non-log line unchanged.\n\n"
+        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED because you modified non-log source lines.\n"
+        "THIS TIME: output every single non-log line EXACTLY as it appears in the input.\n\n"
     ) if is_retry else ""
 
     return (
@@ -273,7 +305,6 @@ def build_prompt(is_retry: bool = False) -> str:
 def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = False) -> str:
     url   = "https://api.groq.com/openai/v1/chat/completions"
     label = f"chunk {chunk_index}" if chunk_index is not None else "fichier"
-
     payload = {
         "model": GROQ_MODEL,
         "max_tokens": MAX_TOKENS_OUT,
@@ -291,24 +322,19 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
-
             if resp.status_code == 429:
                 wait = int(resp.headers.get("retry-after", RATE_LIMIT_BASE_WAIT * (2 ** attempt)))
                 logger.warning(f"🚦 Rate limit {label} → attente {wait}s (tentative {attempt+1})")
                 time.sleep(wait)
                 continue
-
             if resp.status_code != 200:
                 raise Exception(f"Groq error {resp.status_code}: {resp.text[:200]}")
-
-            choice  = resp.json()["choices"][0]
+            choice = resp.json()["choices"][0]
             if choice.get("finish_reason") == "length":
                 logger.warning(f"  ⚠️ {label}: finish_reason=length — réponse tronquée par max_tokens")
-
             content = choice["message"]["content"]
             content = re.sub(r"```.*?\n", "", content).replace("```", "").strip()
             return content
-
         except requests.exceptions.Timeout:
             wait = RATE_LIMIT_BASE_WAIT * (2 ** attempt)
             logger.warning(f"⏱️ Timeout {label} → attente {wait}s (tentative {attempt+1})")
@@ -317,33 +343,18 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
     raise Exception(f"Max retries atteint sur {label}")
 
 
-# ================= VALIDATION FINALE =================
-def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
-    orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
-    new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
-    loss = len(orig_non_log) - len(new_non_log)
-    if abs(loss) <= 3:
-        if loss != 0:
-            logger.warning(f"  Validation finale: Δ non-log = {loss} (toléré)")
-        return True, "ok"
-    logger.error(f"  Validation finale REJETÉ: perte {loss} lignes non-log")
-    return False, f"modification code métier ({loss} lignes)"
-
-
 # ================= REFACTOR =================
 def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
     logger.info(f"  → Chunk {chunk_index}/{total} ({len(chunk):,} chars) → Groq...")
     result = call_groq(chunk, chunk_index=chunk_index)
 
-    # Chunks triviaux : pas de validation
     if len(chunk.strip()) < MIN_CHUNK_SIZE_FOR_CHECKS:
         logger.info(f"  ✅ Chunk {chunk_index}/{total}: trivial — pas de validation")
         return result
 
-    truncated  = detect_truncation(result)
-    ok, reason = check_chunk_non_log_loss(chunk, result, chunk_index)
+    truncated      = detect_truncation(result)
+    ok, reason     = check_chunk_non_log_loss(chunk, result, chunk_index)
 
-    # ⭐ Log précis sur la raison du retry
     if truncated:
         logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: troncature détectée — retry...")
     elif not ok:
@@ -352,14 +363,11 @@ def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
     if truncated or not ok:
         time.sleep(REQUEST_DELAY)
         result = call_groq(chunk, chunk_index=chunk_index, is_retry=True)
-
-        # Vérification post-retry
         ok2, reason2 = check_chunk_non_log_loss(chunk, result, chunk_index)
-        if not ok2:
-            logger.error(f"  ❌ Chunk {chunk_index}/{total}: retry échoué — {reason2}")
-            # On garde quand même le meilleur résultat (le 2e peut être mieux même si hors seuil)
-        else:
+        if ok2:
             logger.info(f"  ✅ Chunk {chunk_index}/{total}: retry OK")
+        else:
+            logger.error(f"  ❌ Chunk {chunk_index}/{total}: retry échoué — {reason2} (on continue)")
 
     return result
 
@@ -392,7 +400,6 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     time.sleep(delay)
 
             new_code = "\n".join(refactored_chunks)
-
         else:
             logger.info(f"  → Fichier complet ({len(original_code):,} chars) → Groq...")
             new_code = call_groq(original_code)
@@ -400,12 +407,12 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 logger.warning("⚠️ Troncature fichier entier — retry...")
                 new_code = call_groq(original_code, is_retry=True)
 
-        # Filet de sécurité : doublons inter-chunks que le LLM ne voit pas
+        # Filet de sécurité : doublons inter-chunks
         new_code, dedup_count = deduplicate_applogger(new_code)
         if dedup_count:
             logger.info(f"  🔁 Filet Python: {dedup_count} doublon(s) AppLogger inter-chunks supprimé(s)")
 
-        # Validation finale
+        # Validation finale par SET
         valid, reason = validate_refactoring(original_code, new_code, filepath)
         if not valid:
             logger.error(f"🚫 {filepath} rejeté: {reason}")
@@ -465,7 +472,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "16.3-stable",
+        "version": "16.4-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -479,5 +486,6 @@ def health():
         "chunk_size": CHUNK_SIZE,
         "max_file_size": MAX_FILE_SIZE,
         "max_tokens_out": MAX_TOKENS_OUT,
-        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
+        "non_log_diff_max_per_chunk": NON_LOG_DIFF_MAX_PER_CHUNK,
+        "non_log_diff_max_final": NON_LOG_DIFF_MAX_FINAL
     }
