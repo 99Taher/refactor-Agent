@@ -17,7 +17,7 @@ from pydantic import BaseModel
 MAX_FILES        = 10
 MAX_WORKERS      = 1
 GROQ_TIMEOUT     = 60
-CLONE_DEPTH      = 500   # ⭐ augmenté pour couvrir plus d'historique
+CLONE_DEPTH      = 500
 REQUEST_DELAY    = 3
 MAX_RETRIES      = 5
 CHUNK_SIZE       = 8000
@@ -79,17 +79,15 @@ def split_code(code: str) -> List[str]:
     return chunks
 
 
-# ================= DEDUPLICATION =================
+# ================= DEDUPLICATION PYTHON (filet de sécurité) =================
 
-APPLOGGER_LINE = re.compile(
-    r"^(?P<indent>\s*)AppLogger\.[diwev]\(.*\)\s*$"
-)
+APPLOGGER_LINE = re.compile(r"^\s*AppLogger\.[diwev]\(.*\)\s*$")
 
 
 def deduplicate_applogger(code: str) -> str:
     """
-    Supprime les doublons consécutifs de lignes AppLogger identiques.
-    Opère sur le fichier complet assemblé — couvre les doublons inter-chunks.
+    Filet de sécurité Python : supprime les doublons consécutifs identiques
+    que le LLM aurait manqués (ex: doublons inter-chunks).
     """
     lines = code.splitlines(keepends=True)
     result = []
@@ -105,7 +103,6 @@ def deduplicate_applogger(code: str) -> str:
             duplicates = j - i - 1
             if duplicates > 0:
                 removed += duplicates
-                logger.debug(f"  🔁 Dedup: {duplicates}x '{current.strip()[:60]}'")
             result.append(current)
             i = j
         else:
@@ -113,7 +110,7 @@ def deduplicate_applogger(code: str) -> str:
             i += 1
 
     if removed:
-        logger.info(f"  🔁 Déduplication Python: {removed} ligne(s) AppLogger en double supprimée(s)")
+        logger.info(f"  🔁 Filet de sécurité Python: {removed} doublon(s) AppLogger supprimé(s) après le LLM")
 
     return "".join(result)
 
@@ -146,10 +143,6 @@ def clone_repo(repo_url: str, branch: str) -> Path:
 
 
 def _try_diff(repo_path: Path, base: str, dot: str) -> Optional[str]:
-    """
-    Tente un git diff avec dot='...' ou '..'.
-    Retourne la sortie ou None si erreur (ex: no merge base).
-    """
     try:
         result = run_git(
             ["git", "diff", "--name-only", f"{base}{dot}HEAD", "--"],
@@ -164,7 +157,6 @@ def _try_diff(repo_path: Path, base: str, dot: str) -> Optional[str]:
 def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
     logger.info(f"Detecting changed files (base={base_ref})...")
 
-    # Fetch de la branche base
     try:
         run_git([
             "git", "fetch", "origin",
@@ -185,7 +177,6 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
     logger.info(f"Branches disponibles: {branches}")
 
-    # Choisir la référence de base
     if origin_branch in branches:
         base_ref_for_diff = origin_branch
         logger.info(f"✅ Diff avec {origin_branch}")
@@ -194,21 +185,19 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
         logger.warning(f"⚠️ Branch {origin_branch} non trouvée — fallback origin/HEAD")
     else:
         base_ref_for_diff = "HEAD^"
-        logger.warning(f"⚠️ Fallback HEAD^")
+        logger.warning("⚠️ Fallback HEAD^")
 
-    diff = None
-
-    # ⭐ Essai 1 : three-dot (nécessite un merge base)
+    # Essai 1 : three-dot
     diff = _try_diff(repo_path, base_ref_for_diff, "...")
 
-    # ⭐ Essai 2 : si "no merge base" → two-dot (ne nécessite pas d'ancêtre commun)
+    # Essai 2 : two-dot (pas besoin de merge base)
     if diff is None:
         logger.warning("⚠️ Three-dot diff échoué (no merge base?) — essai two-dot...")
         diff = _try_diff(repo_path, base_ref_for_diff, "..")
 
-    # ⭐ Essai 3 : deepen l'historique et réessayer
+    # Essai 3 : deepen + retry
     if diff is None:
-        logger.warning("⚠️ Two-dot diff échoué — approfondissement de l'historique (--deepen=500)...")
+        logger.warning("⚠️ Two-dot diff échoué — approfondissement historique (--deepen=500)...")
         try:
             run_git(["git", "fetch", "--deepen=500", "origin", base_ref], cwd=repo_path, check=False)
             run_git(["git", "fetch", "--deepen=500", "origin", "HEAD"], cwd=repo_path, check=False)
@@ -218,16 +207,15 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
         if diff is None:
             diff = _try_diff(repo_path, base_ref_for_diff, "..")
 
-    # ⭐ Essai 4 : fallback ultime — tous les fichiers .kt modifiés localement
+    # Essai 4 : fallback git status
     if diff is None:
-        logger.warning("⚠️ Tous les diff ont échoué — fallback: fichiers .kt avec status git")
+        logger.warning("⚠️ Tous les diff ont échoué — fallback git status...")
         try:
             status = run_git(["git", "status", "--short"], cwd=repo_path, check=False)
             diff = "\n".join(
                 line.split()[-1] for line in status.splitlines()
                 if line.strip().endswith(".kt")
             )
-            logger.info(f"  Fallback status: '{diff[:200]}'")
         except Exception as e:
             logger.error(f"Fallback status échoué: {e}")
             diff = ""
@@ -283,7 +271,7 @@ def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -
     logger.info(
         f"  📊 Chunk {chunk_index}: total {orig_total}→{new_total} | "
         f"non-log {len(orig_non_log)}→{len(new_non_log)} | "
-        f"log {orig_log}→{new_log} (déduplication: {orig_log - new_log} supprimés)"
+        f"log {orig_log}→{new_log} (déduplication LLM: {orig_log - new_log} supprimés)"
     )
 
     orig_set = set(orig_non_log)
@@ -312,40 +300,44 @@ def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -
     return False, msg
 
 
-def build_chunk_prompt(is_retry: bool = False) -> str:
+def build_prompt(is_retry: bool = False) -> str:
+    """
+    Prompt principal fourni — utilisé tel quel pour le refactoring et la déduplication.
+    En cas de retry, on ajoute un avertissement en tête.
+    """
     retry_prefix = (
-        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED: you removed non-log lines.\n"
-        "THIS TIME: copy every single non-log line into your output unchanged. "
-        "Only modify lines that are Log.x / Logr.x / AppSTLogger calls.\n\n"
+        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED because you removed non-log source lines.\n"
+        "THIS TIME: output every single non-log line unchanged. "
+        "Only modify Log.x / Logr.x / AppSTLogger lines.\n\n"
     ) if is_retry else ""
 
     return (
         retry_prefix +
-        "You are a Kotlin log-refactoring tool.\n"
-        "Input: a FRAGMENT of a Kotlin file.\n"
-        "Output: the SAME fragment with ONLY logging calls refactored.\n\n"
+        "You are a Kotlin Refactoring Expert.\n"
+        "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
 
-        "ABSOLUTE RULES:\n"
-        " - Output EVERY line of the input. Zero omissions.\n"
-        " - NEVER write '// ...', '...', or any placeholder.\n"
-        " - DO NOT modify any business logic, control flow, variable names,\n"
-        "   function signatures, return values, or non-log code.\n"
-        " - ONLY change: Log.x / Logr.x / AppSTLogger.appendLogST calls and their imports.\n\n"
+        "🚨 CRITICAL — OUTPUT RULES:\n"
+        " - Return THE COMPLETE CODE. Every single line. No truncation.\n"
+        " - NEVER use '// ...', '...', or any placeholder to skip code.\n"
+        " - DO NOT modify business logic, control flow, variable names,\n"
+        "   function signatures, or return values.\n\n"
 
-        "CONVERSIONS:\n"
-        " - Log.d/i/w/e(tag, msg)                         -> AppLogger.d/i/w/e(tag, msg)\n"
-        " - Logr.d/i/w/e(tag, msg)                        -> AppLogger.d/i/w/e(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.DEBUG, ..)  -> AppLogger.d(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.INFO, ..)   -> AppLogger.i(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.WARN, ..)   -> AppLogger.w(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.ERROR, ..)  -> AppLogger.e(tag, msg)\n\n"
+        "1. CONVERSION RULES:\n"
+        "   - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg)  -> AppLogger.i(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg)  -> AppLogger.w(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
 
-        "IMPORTS (first fragment only):\n"
-        " - ADD:    import com.honeywell.domain.managers.loggerApp.AppLogger\n"
-        " - REMOVE: android.util.Log, Logr, STLevelLog, AppSTLogger imports\n\n"
+        "2. DEDUPLICATION RULE (CRITICAL):\n"
+        "   - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
+        "   - Example: Multiple AppLogger.e(MODULE, 'text') calls become just one.\n\n"
 
-        "FORMAT: raw Kotlin only. No markdown. No backticks. No explanations.\n"
-        "Preserve all indentation and blank lines.\n"
+        "3. IMPORTS:\n"
+        "   - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
+        "   - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
+
+        "Return ONLY raw source code. NO markdown markers, NO explanations."
     )
 
 
@@ -359,11 +351,11 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
         "messages": [
             {
                 "role": "system",
-                "content": "You are a code transformer. Output raw Kotlin only. Never truncate. Return every line."
+                "content": "Output raw Kotlin code only. Return every line. Never truncate."
             },
             {
                 "role": "user",
-                "content": build_chunk_prompt(is_retry=is_retry) + "\n\nFRAGMENT:\n" + code
+                "content": build_prompt(is_retry=is_retry) + "\n\nCODE:\n" + code
             }
         ],
         "temperature": 0
@@ -451,10 +443,12 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
     result = call_groq(chunk, chunk_index=chunk_index)
 
+    # Chunk trivial : pas de validation
     if len(chunk.strip()) < MIN_CHUNK_SIZE_FOR_CHECKS:
         logger.info(f"  ✅ Chunk {chunk_index}/{total}: trivial ({len(chunk)} chars) — pas de validation")
         return result
 
+    # Check 1 : troncature
     if detect_truncation(result):
         logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: troncature détectée — retry...")
         time.sleep(REQUEST_DELAY)
@@ -462,6 +456,7 @@ def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
         if detect_truncation(result):
             raise Exception(f"Chunk {chunk_index}/{total}: troncature persistante après retry")
 
+    # Check 2 : perte de lignes non-log
     ok, reason = check_chunk_non_log_loss(chunk, result, chunk_index)
     if not ok:
         logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: perte code métier — retry...")
@@ -524,7 +519,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             new_code = result
             time.sleep(REQUEST_DELAY)
 
-        # Déduplication Python — fiable, indépendante du LLM
+        # Filet de sécurité : doublons inter-chunks que le LLM ne peut pas voir
         new_code = deduplicate_applogger(new_code)
 
         # Validation finale
@@ -596,7 +591,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "14.0-stable",
+        "version": "15.0-stable",
         "groq_model": GROQ_MODEL
     }
 
