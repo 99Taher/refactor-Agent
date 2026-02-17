@@ -379,7 +379,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     except Exception as e:
         return f"{filepath} - erreur lecture: {e}"
 
-    if not any(x in original_code for x in ["Log.", "AppSTLogger", "Logr."]):
+    if not any(x in original_code for x in ["Log.", "AppSTLogger", "Logr.","AppLogger."]):
         return f"{filepath} - skipped (pas de logs)"
 
     logger.info(f"🤖 Refactoring {filepath} ({len(original_code):,} chars)...")
@@ -489,3 +489,4 @@ def health():
         "non_log_diff_max_per_chunk": NON_LOG_DIFF_MAX_PER_CHUNK,
         "non_log_diff_max_final": NON_LOG_DIFF_MAX_FINAL
     }
+
