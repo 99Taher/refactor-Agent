@@ -23,11 +23,14 @@ REQUEST_DELAY    = 3
 MAX_RETRIES      = 5
 CHUNK_SIZE       = 8000   # llama-3.1-8b-instant = ~8192 tokens output max
 MAX_TOKENS_OUT   = 8000
-RATE_LIMIT_BASE_WAIT = 15 # secondes, doublé à chaque tentative
+RATE_LIMIT_BASE_WAIT  = 15  # secondes, doublé à chaque tentative
+MAX_INTER_CHUNK_DELAY = 15  # ⭐ plafond des pauses entre chunks (secondes)
 
-# Tolérance de perte de lignes NON-LOG par chunk (0 = aucune perte tolérée hors logs)
-# Les lignes de log peuvent légitimement diminuer par déduplication
-NON_LOG_LINE_LOSS_MAX = 2  # nb de lignes non-log perdues autorisées (absolue, pas %)
+# Un chunk de moins de N chars est considéré trivial (ex: `}`) — on saute les checks
+MIN_CHUNK_SIZE_FOR_CHECKS = 100
+
+# Nombre max de lignes non-log perdues par chunk (absolue)
+NON_LOG_LINE_LOSS_MAX = 2
 
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -64,7 +67,7 @@ def run_git(cmd: List[str], cwd=None, check=True):
 def split_code(code: str) -> List[str]:
     """
     Découpe le code en chunks de CHUNK_SIZE caractères max.
-    Coupe sur \nfun  si possible, sinon sur une ligne vide.
+    Coupe sur \\nfun  si possible, sinon sur une ligne vide.
     """
     chunks = []
     start = 0
@@ -198,17 +201,14 @@ def detect_truncation(code: str) -> bool:
 
 def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -> tuple[bool, str]:
     """
-    ⭐ Vérifie uniquement les lignes NON-LOG.
-    Les lignes de log peuvent légitimement diminuer par déduplication.
-    Seules les lignes de code métier doivent rester intactes.
+    Vérifie uniquement les lignes NON-LOG.
+    Les logs peuvent diminuer par déduplication — c'est normal.
     """
     orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
     new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
 
-    # Compter les logs pour info
     orig_log = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
     new_log  = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
-
     orig_total = len([l for l in original.splitlines()   if l.strip()])
     new_total  = len([l for l in refactored.splitlines() if l.strip()])
 
@@ -218,7 +218,6 @@ def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -
         f"log {orig_log}→{new_log} (déduplication: {orig_log - new_log} supprimés)"
     )
 
-    # Calcul du delta sur les lignes non-log uniquement
     orig_set = set(orig_non_log)
     new_set  = set(new_non_log)
     removed  = orig_set - new_set
@@ -350,7 +349,6 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
 # ================= VALIDATION FINALE =================
 
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
-    """Validation finale sur le fichier complet assemblé."""
     orig_lines   = original.splitlines()
     new_lines    = refactored.splitlines()
 
@@ -366,7 +364,7 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
     added    = new_set  - orig_set
     removed  = orig_set - new_set
 
-    # Tolérance : max 2 lignes non-log différentes sur tout le fichier
+    # Tolérance globale : max 2 lignes non-log différentes sur tout le fichier
     if len(added) <= 2 and len(removed) <= 2:
         for line in list(added)[:2]:
             logger.warning(f"  Ligne ajoutée:    '{line[:80]}'")
@@ -392,10 +390,15 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
     """
     Envoie un chunk à Groq.
-    Vérifie troncature puis perte de lignes NON-LOG.
-    Retente avec prompt renforcé si nécessaire.
+    ⭐ Les chunks triviaux (< MIN_CHUNK_SIZE_FOR_CHECKS chars) passent sans validation
+       pour éviter les faux positifs sur des `}` ou fins de fichier.
     """
     result = call_groq(chunk, chunk_index=chunk_index)
+
+    # ⭐ Chunk trivial : pas de validation (faux positifs garantis)
+    if len(chunk.strip()) < MIN_CHUNK_SIZE_FOR_CHECKS:
+        logger.info(f"  ✅ Chunk {chunk_index}/{total}: trivial ({len(chunk)} chars) — pas de validation")
+        return result
 
     # Check 1 : marqueurs de troncature explicites
     if detect_truncation(result):
@@ -450,9 +453,9 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     )
                     return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:120]}"
 
-                # Délai progressif entre chunks
+                # ⭐ Délai progressif plafonné à MAX_INTER_CHUNK_DELAY
                 if i < total - 1:
-                    delay = REQUEST_DELAY * (i + 1)
+                    delay = min(REQUEST_DELAY * (i + 1), MAX_INTER_CHUNK_DELAY)
                     logger.info(f"  Pause {delay}s avant chunk suivant...")
                     time.sleep(delay)
 
@@ -538,7 +541,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "11.0-stable",
+        "version": "12.0-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -554,5 +557,7 @@ def health():
         "request_delay": REQUEST_DELAY,
         "max_retries": MAX_RETRIES,
         "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT,
-        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
+        "max_inter_chunk_delay": MAX_INTER_CHUNK_DELAY,
+        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX,
+        "min_chunk_size_for_checks": MIN_CHUNK_SIZE_FOR_CHECKS
     }
