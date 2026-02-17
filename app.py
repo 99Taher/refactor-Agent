@@ -29,7 +29,7 @@ MAX_INTER_CHUNK_DELAY = 15
 MIN_CHUNK_SIZE_FOR_CHECKS = 100
 NON_LOG_LINE_LOSS_MAX     = 2
 
-GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET   = os.getenv("API_SECRET")
@@ -611,3 +611,4 @@ def health():
         "max_inter_chunk_delay": MAX_INTER_CHUNK_DELAY,
         "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
     }
+
