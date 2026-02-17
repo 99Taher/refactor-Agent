@@ -234,28 +234,92 @@ def call_groq(code: str) -> str:
     raise Exception("Max retries reached (rate limit)")
 
 
+# ================= VALIDATION =================
+
+LOG_PATTERNS = re.compile(
+    r"(Log\.[diwev]\(|Logr\.[diwev]\(|AppSTLogger\.appendLogST\(|AppLogger\.[diwev]\()"
+)
+
+def is_log_line(line: str) -> bool:
+    """Retourne True si la ligne est liée aux logs."""
+    stripped = line.strip()
+    return bool(LOG_PATTERNS.search(stripped)) or any(imp in stripped for imp in [
+        "import android.util.Log",
+        "import com.honeywell",
+        "import com.st.model.log",
+        "AppSTLogger",
+        "STLevelLog",
+        "Logr",
+        "AppLogger",
+    ])
+
+def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
+    """
+    Vérifie que le LLM n'a modifié QUE les lignes de logs.
+    Retourne (valide, message).
+    """
+    orig_lines = original.splitlines()
+    new_lines = refactored.splitlines()
+
+    # Tolérer une différence de ±5% de lignes (imports supprimés/ajoutés)
+    if abs(len(orig_lines) - len(new_lines)) > max(10, len(orig_lines) * 0.05):
+        msg = f"❌ REJETÉ: trop de lignes modifiées ({len(orig_lines)} → {len(new_lines)})"
+        logger.error(f"{filepath}: {msg}")
+        return False, msg
+
+    # Comparer ligne par ligne les lignes NON-log
+    changed_non_log = []
+    max_len = max(len(orig_lines), len(new_lines))
+    padded_orig = orig_lines + [""] * (max_len - len(orig_lines))
+    padded_new = new_lines + [""] * (max_len - len(new_lines))
+
+    for i, (o, n) in enumerate(zip(padded_orig, padded_new)):
+        if o != n and not is_log_line(o) and not is_log_line(n):
+            changed_non_log.append((i + 1, o, n))
+
+    if changed_non_log:
+        # Afficher les 3 premières différences suspectes
+        for lineno, orig, new in changed_non_log[:3]:
+            logger.warning(f"  Ligne {lineno}: '{orig.strip()}' → '{new.strip()}'")
+
+        # Bloquer si plus de 3 lignes non-log modifiées
+        if len(changed_non_log) > 3:
+            msg = f"❌ REJETÉ: {len(changed_non_log)} lignes non-log modifiées"
+            logger.error(f"{filepath}: {msg}")
+            return False, msg
+
+    logger.info(f"✅ Validation OK ({len(changed_non_log)} lignes non-log modifiées, dans la tolérance)")
+    return True, "ok"
+
+
 # ================= REFACTOR =================
 
 def refactor_file(repo_path: Path, filepath: str) -> str:
     full_path = repo_path / filepath
 
     try:
-        code = full_path.read_text(encoding="utf-8")
+        original_code = full_path.read_text(encoding="utf-8")
     except Exception as e:
         return f"{filepath} - erreur lecture: {e}"
 
-    if not any(x in code for x in ["Log.", "AppSTLogger", "Logr."]):
+    if not any(x in original_code for x in ["Log.", "AppSTLogger", "Logr."]):
         return f"{filepath} - skipped (pas de logs)"
 
-    if len(code) > MAX_FILE_SIZE:
-        logger.warning(f"⚠️ {filepath} trop gros ({len(code):,} chars), ignoré")
-        # ⭐ FIX: Retourner "trop gros" pour que le workflow le détecte
-        return f"{filepath} - trop gros ({len(code):,} chars)"
+    if len(original_code) > MAX_FILE_SIZE:
+        logger.warning(f"⚠️ {filepath} trop gros ({len(original_code):,} chars), ignoré")
+        return f"{filepath} - trop gros ({len(original_code):,} chars)"
 
-    logger.info(f"🤖 Refactoring {filepath} ({len(code):,} chars)...")
+    logger.info(f"🤖 Refactoring {filepath} ({len(original_code):,} chars)...")
 
     try:
-        new_code = call_groq(code)
+        new_code = call_groq(original_code)
+
+        # ⭐ VALIDATION: Vérifier que seuls les logs ont changé
+        valid, reason = validate_refactoring(original_code, new_code, filepath)
+        if not valid:
+            logger.error(f"🚫 Refactoring rejeté pour {filepath}: {reason}")
+            return f"{filepath} - rejeté (LLM a modifié du code non-log)"
+
         full_path.write_text(new_code, encoding="utf-8")
         time.sleep(REQUEST_DELAY)
         logger.info(f"✅ {filepath} refactorisé")
