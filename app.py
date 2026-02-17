@@ -14,21 +14,23 @@ from pydantic import BaseModel
 
 # ================= CONFIG =================
 
-MAX_FILES = 10
-MAX_WORKERS = 1
-GROQ_TIMEOUT = 60
-CLONE_DEPTH = 200
-MAX_FILE_SIZE = 50000
-REQUEST_DELAY = 3
-MAX_RETRIES = 5
-CHUNK_SIZE = 25000
-RATE_LIMIT_BASE_WAIT = 15  # secondes, doublé à chaque tentative
+MAX_FILES        = 10
+MAX_WORKERS      = 1
+GROQ_TIMEOUT     = 60
+CLONE_DEPTH      = 200
+MAX_FILE_SIZE    = 50000
+REQUEST_DELAY    = 3
+MAX_RETRIES      = 5
+CHUNK_SIZE       = 25000
+RATE_LIMIT_BASE_WAIT = 15   # secondes, doublé à chaque tentative
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# Tolérance de perte de lignes par chunk (5 % max)
+CHUNK_LINE_LOSS_TOLERANCE = 0.05
 
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-API_SECRET = os.getenv("API_SECRET")
+API_SECRET   = os.getenv("API_SECRET")
 
 # ==========================================
 
@@ -45,7 +47,7 @@ app = FastAPI()
 class RefactorRequest(BaseModel):
     repo_url: str
     base_ref: str = "main"
-    branch: str = "auto-refactor"
+    branch:   str = "auto-refactor"
 
 
 # ================= UTIL =================
@@ -156,20 +158,71 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
 # ================= GROQ =================
 
-def call_groq(code: str, chunk_index: Optional[int] = None) -> str:
-    """
-    Appelle l'API Groq avec backoff exponentiel sur rate limit.
-    Lit le header Retry-After si disponible.
-    """
-    url = "https://api.groq.com/openai/v1/chat/completions"
+# ⭐ Détecte si le LLM a tronqué sa réponse (patterns typiques de résumé)
+TRUNCATION_PATTERNS = re.compile(
+    r"(^\s*//\s*\.\.\.\s*$"           # // ...
+    r"|^\s*/\*\s*\.\.\.\s*\*/\s*$"    # /* ... */
+    r"|^\s*\.\.\.\s*$"                # ...
+    r"|^\s*//\s*rest of (the )?code"  # // rest of code
+    r"|^\s*//\s*\[truncated\]"        # // [truncated]
+    r")",
+    re.IGNORECASE | re.MULTILINE
+)
 
-    label = f"chunk {chunk_index}" if chunk_index is not None else "fichier"
 
-    prompt = (
+def detect_truncation(code: str) -> bool:
+    """Retourne True si le LLM a inséré des marqueurs de troncature."""
+    return bool(TRUNCATION_PATTERNS.search(code))
+
+
+def check_chunk_line_loss(original: str, refactored: str, chunk_index: int) -> bool:
+    """
+    Vérifie que le chunk refactorisé n'a pas perdu trop de lignes non-vides.
+    Tolérance : CHUNK_LINE_LOSS_TOLERANCE (5%).
+    Une légère réduction est normale grâce à la déduplication des logs.
+    """
+    orig_lines = [l for l in original.splitlines() if l.strip()]
+    new_lines  = [l for l in refactored.splitlines() if l.strip()]
+
+    if not orig_lines:
+        return True
+
+    loss_ratio = (len(orig_lines) - len(new_lines)) / len(orig_lines)
+
+    if loss_ratio > CHUNK_LINE_LOSS_TOLERANCE:
+        logger.error(
+            f"  ❌ Chunk {chunk_index}: perte de {loss_ratio:.1%} des lignes "
+            f"({len(orig_lines)} → {len(new_lines)}) — seuil={CHUNK_LINE_LOSS_TOLERANCE:.0%}"
+        )
+        return False
+
+    logger.info(
+        f"  ✅ Chunk {chunk_index}: lignes {len(orig_lines)} → {len(new_lines)} "
+        f"(Δ {loss_ratio:.1%})"
+    )
+    return True
+
+
+def build_chunk_prompt(is_retry: bool = False) -> str:
+    """
+    Construit le prompt selon qu'il s'agit d'un premier essai ou d'un retry.
+    En cas de retry, renforce l'interdiction de tronquer.
+    """
+    retry_prefix = (
+        "⚠️ PREVIOUS ATTEMPT FAILED: you truncated the code with '// ...' or similar.\n"
+        "THIS TIME: return EVERY SINGLE LINE of the fragment — including all business logic, "
+        "comments, blank lines, and non-log code. Do NOT skip anything.\n\n"
+    ) if is_retry else ""
+
+    return (
+        retry_prefix +
         "You are a Kotlin Refactoring Expert.\n"
-        "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
+        "You are receiving a FRAGMENT of a larger Kotlin file.\n\n"
 
-        "🚨 CRITICAL CONSTRAINT:\n"
+        "🚨 ABSOLUTE RULES — VIOLATION = FAILURE:\n"
+        " - Return THE COMPLETE FRAGMENT. Every single line. No exceptions.\n"
+        " - NEVER use '// ...', '/* ... */', '...', or any placeholder.\n"
+        " - NEVER summarize, truncate, or omit ANY part of the code.\n"
         " - DO NOT modify business logic.\n"
         " - DO NOT change control flow (if, when, for, while, try/catch).\n"
         " - DO NOT modify variable names.\n"
@@ -179,34 +232,49 @@ def call_groq(code: str, chunk_index: Optional[int] = None) -> str:
         " - DO NOT optimize code.\n"
         " - ONLY refactor logging statements.\n\n"
 
-        "1. CONVERSION RULES:\n"
+        "CONVERSION RULES:\n"
         " - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
         " - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg) -> AppLogger.i(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg) -> AppLogger.w(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg)  -> AppLogger.i(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg)  -> AppLogger.w(tag, msg)\n"
         " - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
 
-        "2. DEDUPLICATION RULE (CRITICAL):\n"
-        " - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
-        " - Only merge if they are strictly identical and consecutive.\n\n"
+        "DEDUPLICATION RULE:\n"
+        " - Merge consecutive AppLogger calls with EXACT SAME tag+message into ONE.\n"
+        " - Only merge strictly identical consecutive lines.\n\n"
 
-        "3. IMPORTS:\n"
+        "IMPORTS (only for the first fragment):\n"
         " - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
-        " - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n"
+        " - REMOVE: android.util.Log, Logr, STLevelLog, AppSTLogger imports.\n"
         " - Do not modify any other imports.\n\n"
 
-        "Return ONLY raw source code.\n"
-        "NO markdown.\n"
-        "NO explanations.\n"
-        "NO comments added.\n"
-        "Preserve formatting and indentation."
+        "OUTPUT FORMAT:\n"
+        " - Return ONLY raw source code.\n"
+        " - NO markdown. NO backticks. NO explanations. NO added comments.\n"
+        " - Preserve all original formatting and indentation.\n"
+        " - The output line count must be close to the input line count.\n"
     )
+
+
+def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = False) -> str:
+    """
+    Appelle l'API Groq avec backoff exponentiel sur rate limit.
+    Lit le header Retry-After si disponible.
+    """
+    url   = "https://api.groq.com/openai/v1/chat/completions"
+    label = f"chunk {chunk_index}" if chunk_index is not None else "fichier"
 
     payload = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Output raw code only."},
-            {"role": "user", "content": prompt + "\n\nCODE:\n" + code}
+            {
+                "role": "system",
+                "content": "Output raw Kotlin code only. Return every line. Never truncate."
+            },
+            {
+                "role": "user",
+                "content": build_chunk_prompt(is_retry=is_retry) + "\n\nFRAGMENT:\n" + code
+            }
         ],
         "temperature": 0
     }
@@ -228,7 +296,6 @@ def call_groq(code: str, chunk_index: Optional[int] = None) -> str:
             raise Exception(f"Erreur réseau Groq: {e}")
 
         if resp.status_code == 429:
-            # Lire le header Retry-After si présent, sinon backoff exponentiel
             retry_after = int(resp.headers.get("retry-after", RATE_LIMIT_BASE_WAIT * (2 ** attempt)))
             logger.warning(
                 f"🚦 Rate limit sur {label} (tentative {attempt+1}/{MAX_RETRIES}). "
@@ -265,8 +332,8 @@ def is_log_related(line: str) -> bool:
 
 
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
-    orig_lines = original.splitlines()
-    new_lines = refactored.splitlines()
+    orig_lines   = original.splitlines()
+    new_lines    = refactored.splitlines()
 
     orig_non_log = [l.strip() for l in orig_lines if l.strip() and not is_log_related(l)]
     new_non_log  = [l.strip() for l in new_lines  if l.strip() and not is_log_related(l)]
@@ -277,9 +344,8 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 
     orig_set = set(orig_non_log)
     new_set  = set(new_non_log)
-
-    added   = new_set  - orig_set
-    removed = orig_set - new_set
+    added    = new_set  - orig_set
+    removed  = orig_set - new_set
 
     if len(added) <= 2 and len(removed) <= 2:
         for line in list(added)[:2]:
@@ -303,6 +369,38 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 
 # ================= REFACTOR =================
 
+def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
+    """
+    Envoie un chunk à Groq.
+    Si le résultat est tronqué ou a perdu trop de lignes, retente avec un prompt renforcé.
+    """
+    result = call_groq(chunk, chunk_index=chunk_index)
+
+    # ⭐ Check 1 : marqueurs de troncature explicites (// ..., ...)
+    if detect_truncation(result):
+        logger.warning(
+            f"  ⚠️ Chunk {chunk_index}/{total}: troncature détectée — retry avec prompt renforcé..."
+        )
+        time.sleep(REQUEST_DELAY)
+        result = call_groq(chunk, chunk_index=chunk_index, is_retry=True)
+        if detect_truncation(result):
+            raise Exception(f"Chunk {chunk_index}/{total}: troncature persistante après retry")
+
+    # ⭐ Check 2 : perte de lignes > 5%
+    if not check_chunk_line_loss(chunk, result, chunk_index):
+        logger.warning(
+            f"  ⚠️ Chunk {chunk_index}/{total}: trop de lignes perdues — retry avec prompt renforcé..."
+        )
+        time.sleep(REQUEST_DELAY)
+        result = call_groq(chunk, chunk_index=chunk_index, is_retry=True)
+        if not check_chunk_line_loss(chunk, result, chunk_index):
+            raise Exception(
+                f"Chunk {chunk_index}/{total}: perte de lignes persistante après retry"
+            )
+
+    return result
+
+
 def refactor_file(repo_path: Path, filepath: str) -> str:
     full_path = repo_path / filepath
 
@@ -319,25 +417,23 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     try:
         if len(original_code) > MAX_FILE_SIZE:
             chunks = split_code(original_code)
-            total = len(chunks)
+            total  = len(chunks)
             logger.info(f"📦 Grand fichier: divisé en {total} chunks")
 
             refactored_chunks = []
             for i, chunk in enumerate(chunks):
                 logger.info(f"  Chunk {i+1}/{total} ({len(chunk):,} chars)...")
                 try:
-                    result = call_groq(chunk, chunk_index=i + 1)
+                    result = refactor_chunk_with_retry(chunk, i + 1, total)
                     refactored_chunks.append(result)
                 except Exception as chunk_err:
-                    # ⭐ FIX: Récupération partielle — on garde les chunks déjà traités
-                    # et on abandonne proprement avec un message clair
                     logger.error(
-                        f"❌ Échec sur chunk {i+1}/{total}: {chunk_err}. "
-                        f"{len(refactored_chunks)} chunk(s) traité(s) sur {total} — fichier ignoré."
+                        f"❌ Échec chunk {i+1}/{total}: {chunk_err}. "
+                        f"{len(refactored_chunks)}/{total} chunks traités — fichier ignoré."
                     )
-                    return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:100]}"
+                    return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:120]}"
 
-                # ⭐ FIX: Délai progressif entre chunks pour éviter le rate limit
+                # Délai progressif entre chunks
                 if i < total - 1:
                     delay = REQUEST_DELAY * (i + 1)
                     logger.info(f"  Pause {delay}s avant chunk suivant...")
@@ -346,10 +442,17 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             new_code = "\n".join(refactored_chunks)
 
         else:
-            new_code = call_groq(original_code)
+            result = call_groq(original_code)
+
+            if detect_truncation(result):
+                logger.warning("⚠️ Troncature détectée sur fichier entier — retry...")
+                time.sleep(REQUEST_DELAY)
+                result = call_groq(original_code, is_retry=True)
+
+            new_code = result
             time.sleep(REQUEST_DELAY)
 
-        # Validation : seuls les logs doivent avoir changé
+        # Validation finale : seuls les logs doivent avoir changé
         valid, reason = validate_refactoring(original_code, new_code, filepath)
         if not valid:
             logger.error(f"🚫 Refactoring rejeté pour {filepath}: {reason}")
@@ -418,7 +521,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "8.0-stable",
+        "version": "9.0-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -431,5 +534,6 @@ def health():
         "max_workers": MAX_WORKERS,
         "request_delay": REQUEST_DELAY,
         "max_retries": MAX_RETRIES,
-        "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT
+        "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT,
+        "chunk_line_loss_tolerance": CHUNK_LINE_LOSS_TOLERANCE
     }
