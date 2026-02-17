@@ -21,12 +21,13 @@ CLONE_DEPTH      = 200
 MAX_FILE_SIZE    = 8000   # seuil pour activer le chunking
 REQUEST_DELAY    = 3
 MAX_RETRIES      = 5
-CHUNK_SIZE       = 8000   # ⭐ réduit : llama-3.1-8b-instant = ~8192 tokens output max
-MAX_TOKENS_OUT   = 8000   # max_tokens envoyé à l'API Groq
+CHUNK_SIZE       = 8000   # llama-3.1-8b-instant = ~8192 tokens output max
+MAX_TOKENS_OUT   = 8000
 RATE_LIMIT_BASE_WAIT = 15 # secondes, doublé à chaque tentative
 
-# Tolérance de perte de lignes par chunk (5% max)
-CHUNK_LINE_LOSS_TOLERANCE = 0.05
+# Tolérance de perte de lignes NON-LOG par chunk (0 = aucune perte tolérée hors logs)
+# Les lignes de log peuvent légitimement diminuer par déduplication
+NON_LOG_LINE_LOSS_MAX = 2  # nb de lignes non-log perdues autorisées (absolue, pas %)
 
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -63,20 +64,17 @@ def run_git(cmd: List[str], cwd=None, check=True):
 def split_code(code: str) -> List[str]:
     """
     Découpe le code en chunks de CHUNK_SIZE caractères max.
-    Tente de couper sur une limite de fonction (\nfun ) pour éviter
-    de couper au milieu d'un bloc.
+    Coupe sur \nfun  si possible, sinon sur une ligne vide.
     """
     chunks = []
     start = 0
     while start < len(code):
         end = min(start + CHUNK_SIZE, len(code))
         if end < len(code):
-            # Couper sur une fonction si possible
             split = code.rfind("\nfun ", start, end)
             if split != -1 and split > start:
                 end = split
             else:
-                # Sinon couper sur une ligne vide
                 split = code.rfind("\n\n", start, end)
                 if split != -1 and split > start:
                     end = split
@@ -170,6 +168,14 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
 # ================= GROQ =================
 
+LOG_PATTERNS = re.compile(
+    r"(Log\.[diwev]\(|Logr\.[diwev]\(|AppSTLogger\.appendLogST\(|AppLogger\.[diwev]\()"
+)
+
+IMPORT_PATTERNS = re.compile(
+    r"^import\s+(android\.util\.Log|com\.honeywell.*[Ll]og|com\.st.*[Ll]og|.*Logr|.*STLevelLog|.*AppLogger|.*AppSTLogger)"
+)
+
 TRUNCATION_PATTERNS = re.compile(
     r"(^\s*//\s*\.\.\.\s*$"
     r"|^\s*/\*\s*\.\.\.\s*\*/\s*$"
@@ -181,37 +187,69 @@ TRUNCATION_PATTERNS = re.compile(
 )
 
 
+def is_log_related(line: str) -> bool:
+    stripped = line.strip()
+    return bool(LOG_PATTERNS.search(stripped)) or bool(IMPORT_PATTERNS.match(stripped))
+
+
 def detect_truncation(code: str) -> bool:
     return bool(TRUNCATION_PATTERNS.search(code))
 
 
-def check_chunk_line_loss(original: str, refactored: str, chunk_index: int) -> bool:
-    orig_lines = [l for l in original.splitlines() if l.strip()]
-    new_lines  = [l for l in refactored.splitlines() if l.strip()]
+def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -> tuple[bool, str]:
+    """
+    ⭐ Vérifie uniquement les lignes NON-LOG.
+    Les lignes de log peuvent légitimement diminuer par déduplication.
+    Seules les lignes de code métier doivent rester intactes.
+    """
+    orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
+    new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
 
-    if not orig_lines:
-        return True
+    # Compter les logs pour info
+    orig_log = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
+    new_log  = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
 
-    loss_ratio = (len(orig_lines) - len(new_lines)) / len(orig_lines)
-
-    if loss_ratio > CHUNK_LINE_LOSS_TOLERANCE:
-        logger.error(
-            f"  ❌ Chunk {chunk_index}: perte de {loss_ratio:.1%} des lignes "
-            f"({len(orig_lines)} → {len(new_lines)}) — seuil={CHUNK_LINE_LOSS_TOLERANCE:.0%}"
-        )
-        return False
+    orig_total = len([l for l in original.splitlines()   if l.strip()])
+    new_total  = len([l for l in refactored.splitlines() if l.strip()])
 
     logger.info(
-        f"  ✅ Chunk {chunk_index}: lignes {len(orig_lines)} → {len(new_lines)} (Δ {loss_ratio:.1%})"
+        f"  📊 Chunk {chunk_index}: total {orig_total}→{new_total} | "
+        f"non-log {len(orig_non_log)}→{len(new_non_log)} | "
+        f"log {orig_log}→{new_log} (déduplication: {orig_log - new_log} supprimés)"
     )
-    return True
+
+    # Calcul du delta sur les lignes non-log uniquement
+    orig_set = set(orig_non_log)
+    new_set  = set(new_non_log)
+    removed  = orig_set - new_set
+    added    = new_set  - orig_set
+
+    if len(removed) <= NON_LOG_LINE_LOSS_MAX and len(added) <= NON_LOG_LINE_LOSS_MAX:
+        if removed or added:
+            for line in list(removed)[:3]:
+                logger.warning(f"  ⚠️  Non-log supprimée: '{line[:80]}'")
+            for line in list(added)[:3]:
+                logger.warning(f"  ⚠️  Non-log ajoutée:   '{line[:80]}'")
+        logger.info(f"  ✅ Chunk {chunk_index}: code métier OK")
+        return True, "ok"
+
+    msg = (
+        f"Chunk {chunk_index}: {len(removed)} lignes non-log supprimées, "
+        f"{len(added)} ajoutées (max={NON_LOG_LINE_LOSS_MAX})"
+    )
+    logger.error(f"  ❌ {msg}")
+    for line in list(removed)[:3]:
+        logger.error(f"    - '{line[:80]}'")
+    for line in list(added)[:3]:
+        logger.error(f"    + '{line[:80]}'")
+    return False, msg
 
 
 def build_chunk_prompt(is_retry: bool = False) -> str:
     retry_prefix = (
-        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED: you returned only ~40% of the lines.\n"
-        "THIS TIME: copy every single line of the fragment into your output first, "
-        "then apply only the log refactoring changes. Do NOT omit any line.\n\n"
+        "⚠️ YOUR PREVIOUS RESPONSE WAS REJECTED: you removed non-log lines.\n"
+        "THIS TIME: copy every single non-log line into your output unchanged. "
+        "Only modify lines that are Log.x / Logr.x / AppSTLogger calls.\n\n"
     ) if is_retry else ""
 
     return (
@@ -228,12 +266,12 @@ def build_chunk_prompt(is_retry: bool = False) -> str:
         " - ONLY change: Log.x / Logr.x / AppSTLogger.appendLogST calls and their imports.\n\n"
 
         "CONVERSIONS:\n"
-        " - Log.d/i/w/e(tag, msg)                        -> AppLogger.d/i/w/e(tag, msg)\n"
-        " - Logr.d/i/w/e(tag, msg)                       -> AppLogger.d/i/w/e(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.DEBUG, ..) -> AppLogger.d(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.INFO, ..)  -> AppLogger.i(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.WARN, ..)  -> AppLogger.w(tag, msg)\n"
-        " - AppSTLogger.appendLogST(STLevelLog.ERROR, ..) -> AppLogger.e(tag, msg)\n\n"
+        " - Log.d/i/w/e(tag, msg)                         -> AppLogger.d/i/w/e(tag, msg)\n"
+        " - Logr.d/i/w/e(tag, msg)                        -> AppLogger.d/i/w/e(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.DEBUG, ..)  -> AppLogger.d(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.INFO, ..)   -> AppLogger.i(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.WARN, ..)   -> AppLogger.w(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.ERROR, ..)  -> AppLogger.e(tag, msg)\n\n"
 
         "DEDUPLICATION: merge consecutive AppLogger calls with identical tag+message into one.\n\n"
 
@@ -252,7 +290,7 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
 
     payload = {
         "model": GROQ_MODEL,
-        "max_tokens": MAX_TOKENS_OUT,  # ⭐ évite la troncature silencieuse
+        "max_tokens": MAX_TOKENS_OUT,
         "messages": [
             {
                 "role": "system",
@@ -294,21 +332,14 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
         if resp.status_code != 200:
             raise Exception(f"Groq error {resp.status_code}: {resp.text[:200]}")
 
-        data    = resp.json()
-        choice  = data["choices"][0]
-        content = choice["message"]["content"]
+        data   = resp.json()
+        choice = data["choices"][0]
 
-        # ⭐ Détecter une troncature due à la limite de tokens
         finish_reason = choice.get("finish_reason", "")
         if finish_reason == "length":
-            logger.warning(
-                f"  ⚠️ {label}: finish_reason=length — réponse coupée par max_tokens. "
-                f"Chunk trop grand ou modèle surchargé."
-            )
-            # On retourne quand même pour laisser check_chunk_line_loss décider
-        else:
-            logger.debug(f"  finish_reason={finish_reason} sur {label}")
+            logger.warning(f"  ⚠️ {label}: finish_reason=length — réponse coupée par max_tokens")
 
+        content = choice["message"]["content"]
         content = re.sub(r"```.*?\n", "", content)
         content = content.replace("```", "")
         return content.strip()
@@ -316,23 +347,10 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
     raise Exception(f"Max retries atteint ({MAX_RETRIES}) sur {label} — rate limit persistant")
 
 
-# ================= VALIDATION =================
-
-LOG_PATTERNS = re.compile(
-    r"(Log\.[diwev]\(|Logr\.[diwev]\(|AppSTLogger\.appendLogST\(|AppLogger\.[diwev]\()"
-)
-
-IMPORT_PATTERNS = re.compile(
-    r"^import\s+(android\.util\.Log|com\.honeywell.*[Ll]og|com\.st.*[Ll]og|.*Logr|.*STLevelLog|.*AppLogger|.*AppSTLogger)"
-)
-
-
-def is_log_related(line: str) -> bool:
-    stripped = line.strip()
-    return bool(LOG_PATTERNS.search(stripped)) or bool(IMPORT_PATTERNS.match(stripped))
-
+# ================= VALIDATION FINALE =================
 
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
+    """Validation finale sur le fichier complet assemblé."""
     orig_lines   = original.splitlines()
     new_lines    = refactored.splitlines()
 
@@ -340,7 +358,7 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
     new_non_log  = [l.strip() for l in new_lines  if l.strip() and not is_log_related(l)]
 
     if orig_non_log == new_non_log:
-        logger.info("✅ Validation OK — code non-log identique")
+        logger.info("✅ Validation finale OK — code non-log identique")
         return True, "ok"
 
     orig_set = set(orig_non_log)
@@ -348,13 +366,14 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
     added    = new_set  - orig_set
     removed  = orig_set - new_set
 
+    # Tolérance : max 2 lignes non-log différentes sur tout le fichier
     if len(added) <= 2 and len(removed) <= 2:
         for line in list(added)[:2]:
             logger.warning(f"  Ligne ajoutée:    '{line[:80]}'")
         for line in list(removed)[:2]:
             logger.warning(f"  Ligne supprimée:  '{line[:80]}'")
         logger.info(
-            f"✅ Validation OK — différences mineures tolérées "
+            f"✅ Validation finale OK — différences mineures tolérées "
             f"({len(added)} ajout(s), {len(removed)} suppression(s))"
         )
         return True, "ok"
@@ -373,7 +392,8 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
     """
     Envoie un chunk à Groq.
-    Vérifie la troncature et la perte de lignes. Retente avec prompt renforcé si nécessaire.
+    Vérifie troncature puis perte de lignes NON-LOG.
+    Retente avec prompt renforcé si nécessaire.
     """
     result = call_groq(chunk, chunk_index=chunk_index)
 
@@ -385,13 +405,15 @@ def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
         if detect_truncation(result):
             raise Exception(f"Chunk {chunk_index}/{total}: troncature persistante après retry")
 
-    # Check 2 : perte de lignes > 5%
-    if not check_chunk_line_loss(chunk, result, chunk_index):
-        logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: perte de lignes — retry...")
+    # Check 2 : perte de lignes NON-LOG uniquement
+    ok, reason = check_chunk_non_log_loss(chunk, result, chunk_index)
+    if not ok:
+        logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: perte code métier — retry...")
         time.sleep(REQUEST_DELAY)
         result = call_groq(chunk, chunk_index=chunk_index, is_retry=True)
-        if not check_chunk_line_loss(chunk, result, chunk_index):
-            raise Exception(f"Chunk {chunk_index}/{total}: perte de lignes persistante après retry")
+        ok, reason = check_chunk_non_log_loss(chunk, result, chunk_index)
+        if not ok:
+            raise Exception(reason)
 
     return result
 
@@ -428,7 +450,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     )
                     return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:120]}"
 
-                # Délai progressif entre chunks pour ménager le rate limit
+                # Délai progressif entre chunks
                 if i < total - 1:
                     delay = REQUEST_DELAY * (i + 1)
                     logger.info(f"  Pause {delay}s avant chunk suivant...")
@@ -447,7 +469,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             new_code = result
             time.sleep(REQUEST_DELAY)
 
-        # Validation finale
+        # Validation finale sur le fichier complet
         valid, reason = validate_refactoring(original_code, new_code, filepath)
         if not valid:
             logger.error(f"🚫 Refactoring rejeté pour {filepath}: {reason}")
@@ -516,7 +538,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "10.0-stable",
+        "version": "11.0-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -532,5 +554,5 @@ def health():
         "request_delay": REQUEST_DELAY,
         "max_retries": MAX_RETRIES,
         "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT,
-        "chunk_line_loss_tolerance": CHUNK_LINE_LOSS_TOLERANCE
+        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
     }
