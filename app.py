@@ -7,7 +7,7 @@ import logging
 import requests
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -16,12 +16,13 @@ from pydantic import BaseModel
 
 MAX_FILES = 10
 MAX_WORKERS = 1
-GROQ_TIMEOUT = 30
+GROQ_TIMEOUT = 60
 CLONE_DEPTH = 200
 MAX_FILE_SIZE = 50000
-REQUEST_DELAY = 2
-MAX_RETRIES = 3
+REQUEST_DELAY = 3
+MAX_RETRIES = 5
 CHUNK_SIZE = 25000
+RATE_LIMIT_BASE_WAIT = 15  # secondes, doublé à chaque tentative
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
@@ -79,7 +80,6 @@ def clone_repo(repo_url: str, branch: str) -> Path:
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     repo_path = Path(repo_name)
 
-    # ⭐ FIX: Nettoyer le dossier existant
     if repo_path.exists():
         shutil.rmtree(repo_path)
 
@@ -89,7 +89,7 @@ def clone_repo(repo_url: str, branch: str) -> Path:
     run_git([
         "git", "clone",
         "--depth", str(CLONE_DEPTH),
-        "--no-single-branch",  # ⭐ FIX: Récupérer toutes les branches
+        "--no-single-branch",
         "-b", branch,
         clone_url,
         repo_name
@@ -101,7 +101,6 @@ def clone_repo(repo_url: str, branch: str) -> Path:
 def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
     logger.info(f"Detecting changed files (base={base_ref})...")
 
-    # ⭐ FIX: Fetch explicitement la branche base
     try:
         run_git([
             "git", "fetch", "origin",
@@ -111,13 +110,11 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
         logger.info(f"✅ Branch origin/{base_ref} fetched")
     except Exception as e:
         logger.warning(f"⚠️ Fetch direct échoué: {e}")
-        # Fallback: fetch --all
         try:
             run_git(["git", "fetch", "--all", f"--depth={CLONE_DEPTH}"], cwd=repo_path)
         except Exception:
             pass
 
-    # Vérifier si la branche existe
     branches_raw = run_git(["git", "branch", "-r"], cwd=repo_path, check=False)
     branches = [b.strip() for b in branches_raw.splitlines()]
     origin_branch = f"origin/{base_ref}"
@@ -128,9 +125,7 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
         base_ref_for_diff = origin_branch
         logger.info(f"✅ Diff avec {origin_branch}")
     else:
-        # ⭐ FIX: Fallback au merge-base plutôt que FETCH_HEAD
         logger.warning(f"⚠️ Branch {origin_branch} non trouvée")
-        # Essayer avec origin/HEAD
         if "origin/HEAD" in branches:
             base_ref_for_diff = "origin/HEAD"
             logger.info("Fallback: diff avec origin/HEAD")
@@ -161,8 +156,14 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
 # ================= GROQ =================
 
-def call_groq(code: str) -> str:
+def call_groq(code: str, chunk_index: Optional[int] = None) -> str:
+    """
+    Appelle l'API Groq avec backoff exponentiel sur rate limit.
+    Lit le header Retry-After si disponible.
+    """
     url = "https://api.groq.com/openai/v1/chat/completions"
+
+    label = f"chunk {chunk_index}" if chunk_index is not None else "fichier"
 
     prompt = (
         "You are a Kotlin Refactoring Expert.\n"
@@ -216,11 +217,24 @@ def call_groq(code: str) -> str:
     }
 
     for attempt in range(MAX_RETRIES):
-        resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
+        except requests.exceptions.Timeout:
+            wait = RATE_LIMIT_BASE_WAIT * (2 ** attempt)
+            logger.warning(f"⏱️ Timeout sur {label} (tentative {attempt+1}/{MAX_RETRIES}). Attente {wait}s...")
+            time.sleep(wait)
+            continue
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Erreur réseau Groq: {e}")
 
         if resp.status_code == 429:
-            logger.warning(f"Rate limit (tentative {attempt+1}/{MAX_RETRIES}). Attente 10s...")
-            time.sleep(10)
+            # Lire le header Retry-After si présent, sinon backoff exponentiel
+            retry_after = int(resp.headers.get("retry-after", RATE_LIMIT_BASE_WAIT * (2 ** attempt)))
+            logger.warning(
+                f"🚦 Rate limit sur {label} (tentative {attempt+1}/{MAX_RETRIES}). "
+                f"Attente {retry_after}s..."
+            )
+            time.sleep(retry_after)
             continue
 
         if resp.status_code != 200:
@@ -231,7 +245,7 @@ def call_groq(code: str) -> str:
         content = content.replace("```", "")
         return content.strip()
 
-    raise Exception("Max retries reached (rate limit)")
+    raise Exception(f"Max retries atteint ({MAX_RETRIES}) sur {label} — rate limit persistant")
 
 
 # ================= VALIDATION =================
@@ -244,45 +258,40 @@ IMPORT_PATTERNS = re.compile(
     r"^import\s+(android\.util\.Log|com\.honeywell.*[Ll]og|com\.st.*[Ll]og|.*Logr|.*STLevelLog|.*AppLogger|.*AppSTLogger)"
 )
 
+
 def is_log_related(line: str) -> bool:
-    """Retourne True si la ligne est liée aux logs ou imports de logs."""
     stripped = line.strip()
     return bool(LOG_PATTERNS.search(stripped)) or bool(IMPORT_PATTERNS.match(stripped))
 
+
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
-    """
-    Vérifie que le LLM n'a modifié QUE les lignes de logs.
-    Compare les lignes non-log en ignorant les espaces.
-    """
     orig_lines = original.splitlines()
     new_lines = refactored.splitlines()
 
-    # Extraire uniquement les lignes NON-log (code métier)
     orig_non_log = [l.strip() for l in orig_lines if l.strip() and not is_log_related(l)]
     new_non_log  = [l.strip() for l in new_lines  if l.strip() and not is_log_related(l)]
 
-    # Comparer les blocs de code non-log
     if orig_non_log == new_non_log:
-        logger.info(f"✅ Validation OK — code non-log identique")
+        logger.info("✅ Validation OK — code non-log identique")
         return True, "ok"
 
-    # Calculer les différences
     orig_set = set(orig_non_log)
     new_set  = set(new_non_log)
 
     added   = new_set  - orig_set
     removed = orig_set - new_set
 
-    # Tolérer les petites différences (max 2 lignes)
     if len(added) <= 2 and len(removed) <= 2:
         for line in list(added)[:2]:
             logger.warning(f"  Ligne ajoutée:    '{line[:80]}'")
         for line in list(removed)[:2]:
             logger.warning(f"  Ligne supprimée:  '{line[:80]}'")
-        logger.info(f"✅ Validation OK — différences mineures tolérées ({len(added)} ajout(s), {len(removed)} suppression(s))")
+        logger.info(
+            f"✅ Validation OK — différences mineures tolérées "
+            f"({len(added)} ajout(s), {len(removed)} suppression(s))"
+        )
         return True, "ok"
 
-    # Bloquer si trop de différences
     msg = f"❌ REJETÉ: {len(added)} lignes non-log ajoutées, {len(removed)} supprimées"
     logger.error(f"{filepath}: {msg}")
     for line in list(added)[:3]:
@@ -308,26 +317,45 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     logger.info(f"🤖 Refactoring {filepath} ({len(original_code):,} chars)...")
 
     try:
-        # ⭐ Fichier grand → traitement par chunks
         if len(original_code) > MAX_FILE_SIZE:
             chunks = split_code(original_code)
-            logger.info(f"📦 Grand fichier: divisé en {len(chunks)} chunks")
-            new_code = ""
+            total = len(chunks)
+            logger.info(f"📦 Grand fichier: divisé en {total} chunks")
+
+            refactored_chunks = []
             for i, chunk in enumerate(chunks):
-                logger.info(f"  Chunk {i+1}/{len(chunks)} ({len(chunk):,} chars)...")
-                new_code += call_groq(chunk)
-                time.sleep(REQUEST_DELAY)
+                logger.info(f"  Chunk {i+1}/{total} ({len(chunk):,} chars)...")
+                try:
+                    result = call_groq(chunk, chunk_index=i + 1)
+                    refactored_chunks.append(result)
+                except Exception as chunk_err:
+                    # ⭐ FIX: Récupération partielle — on garde les chunks déjà traités
+                    # et on abandonne proprement avec un message clair
+                    logger.error(
+                        f"❌ Échec sur chunk {i+1}/{total}: {chunk_err}. "
+                        f"{len(refactored_chunks)} chunk(s) traité(s) sur {total} — fichier ignoré."
+                    )
+                    return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:100]}"
+
+                # ⭐ FIX: Délai progressif entre chunks pour éviter le rate limit
+                if i < total - 1:
+                    delay = REQUEST_DELAY * (i + 1)
+                    logger.info(f"  Pause {delay}s avant chunk suivant...")
+                    time.sleep(delay)
+
+            new_code = "\n".join(refactored_chunks)
+
         else:
             new_code = call_groq(original_code)
+            time.sleep(REQUEST_DELAY)
 
-        # ⭐ VALIDATION: Vérifier que seuls les logs ont changé
+        # Validation : seuls les logs doivent avoir changé
         valid, reason = validate_refactoring(original_code, new_code, filepath)
         if not valid:
             logger.error(f"🚫 Refactoring rejeté pour {filepath}: {reason}")
             return f"{filepath} - rejeté (LLM a modifié du code non-log)"
 
         full_path.write_text(new_code, encoding="utf-8")
-        time.sleep(REQUEST_DELAY)
         logger.info(f"✅ {filepath} refactorisé")
         return f"{filepath} - refactored"
 
@@ -380,7 +408,6 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
     if any("refactored" in r for r in results):
         commit_and_push(repo_path)
 
-    # ⭐ FIX: Clé "processed_files" pour compatibilité workflow
     return {
         "status": "success",
         "processed_files": results
@@ -391,7 +418,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "7.0-stable",
+        "version": "8.0-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -402,5 +429,7 @@ def health():
         "status": "healthy",
         "groq_model": GROQ_MODEL,
         "max_workers": MAX_WORKERS,
-        "request_delay": REQUEST_DELAY
+        "request_delay": REQUEST_DELAY,
+        "max_retries": MAX_RETRIES,
+        "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT
     }
