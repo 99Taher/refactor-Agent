@@ -17,20 +17,17 @@ from pydantic import BaseModel
 MAX_FILES        = 10
 MAX_WORKERS      = 1
 GROQ_TIMEOUT     = 60
-CLONE_DEPTH      = 200
-MAX_FILE_SIZE    = 8000   # seuil pour activer le chunking
+CLONE_DEPTH      = 500   # ⭐ augmenté pour couvrir plus d'historique
 REQUEST_DELAY    = 3
 MAX_RETRIES      = 5
-CHUNK_SIZE       = 8000   # llama-3.1-8b-instant = ~8192 tokens output max
+CHUNK_SIZE       = 8000
+MAX_FILE_SIZE    = 8000
 MAX_TOKENS_OUT   = 8000
-RATE_LIMIT_BASE_WAIT  = 15  # secondes, doublé à chaque tentative
-MAX_INTER_CHUNK_DELAY = 15  # ⭐ plafond des pauses entre chunks (secondes)
+RATE_LIMIT_BASE_WAIT  = 15
+MAX_INTER_CHUNK_DELAY = 15
 
-# Un chunk de moins de N chars est considéré trivial (ex: `}`) — on saute les checks
 MIN_CHUNK_SIZE_FOR_CHECKS = 100
-
-# Nombre max de lignes non-log perdues par chunk (absolue)
-NON_LOG_LINE_LOSS_MAX = 2
+NON_LOG_LINE_LOSS_MAX     = 2
 
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -65,10 +62,6 @@ def run_git(cmd: List[str], cwd=None, check=True):
 
 
 def split_code(code: str) -> List[str]:
-    """
-    Découpe le code en chunks de CHUNK_SIZE caractères max.
-    Coupe sur \\nfun  si possible, sinon sur une ligne vide.
-    """
     chunks = []
     start = 0
     while start < len(code):
@@ -84,6 +77,45 @@ def split_code(code: str) -> List[str]:
         chunks.append(code[start:end])
         start = end
     return chunks
+
+
+# ================= DEDUPLICATION =================
+
+APPLOGGER_LINE = re.compile(
+    r"^(?P<indent>\s*)AppLogger\.[diwev]\(.*\)\s*$"
+)
+
+
+def deduplicate_applogger(code: str) -> str:
+    """
+    Supprime les doublons consécutifs de lignes AppLogger identiques.
+    Opère sur le fichier complet assemblé — couvre les doublons inter-chunks.
+    """
+    lines = code.splitlines(keepends=True)
+    result = []
+    removed = 0
+
+    i = 0
+    while i < len(lines):
+        current = lines[i]
+        if APPLOGGER_LINE.match(current.rstrip("\n")):
+            j = i + 1
+            while j < len(lines) and lines[j].rstrip("\n") == current.rstrip("\n"):
+                j += 1
+            duplicates = j - i - 1
+            if duplicates > 0:
+                removed += duplicates
+                logger.debug(f"  🔁 Dedup: {duplicates}x '{current.strip()[:60]}'")
+            result.append(current)
+            i = j
+        else:
+            result.append(current)
+            i += 1
+
+    if removed:
+        logger.info(f"  🔁 Déduplication Python: {removed} ligne(s) AppLogger en double supprimée(s)")
+
+    return "".join(result)
 
 
 # ================= GIT =================
@@ -113,9 +145,26 @@ def clone_repo(repo_url: str, branch: str) -> Path:
     return repo_path
 
 
+def _try_diff(repo_path: Path, base: str, dot: str) -> Optional[str]:
+    """
+    Tente un git diff avec dot='...' ou '..'.
+    Retourne la sortie ou None si erreur (ex: no merge base).
+    """
+    try:
+        result = run_git(
+            ["git", "diff", "--name-only", f"{base}{dot}HEAD", "--"],
+            cwd=repo_path
+        )
+        return result
+    except Exception as e:
+        logger.warning(f"  git diff {dot} échoué ({base}): {e}")
+        return None
+
+
 def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
     logger.info(f"Detecting changed files (base={base_ref})...")
 
+    # Fetch de la branche base
     try:
         run_git([
             "git", "fetch", "origin",
@@ -136,37 +185,60 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
     logger.info(f"Branches disponibles: {branches}")
 
+    # Choisir la référence de base
     if origin_branch in branches:
         base_ref_for_diff = origin_branch
         logger.info(f"✅ Diff avec {origin_branch}")
+    elif "origin/HEAD" in branches:
+        base_ref_for_diff = "origin/HEAD"
+        logger.warning(f"⚠️ Branch {origin_branch} non trouvée — fallback origin/HEAD")
     else:
-        logger.warning(f"⚠️ Branch {origin_branch} non trouvée")
-        if "origin/HEAD" in branches:
-            base_ref_for_diff = "origin/HEAD"
-            logger.info("Fallback: diff avec origin/HEAD")
-        else:
-            base_ref_for_diff = "HEAD^"
-            logger.info("Fallback: diff avec HEAD^")
+        base_ref_for_diff = "HEAD^"
+        logger.warning(f"⚠️ Fallback HEAD^")
 
-    try:
-        diff = run_git(
-            ["git", "diff", "--name-only", f"{base_ref_for_diff}...HEAD", "--"],
-            cwd=repo_path
-        )
-        if not diff:
-            logger.info("Aucun fichier modifié trouvé avec three-dot, essai two-dot...")
-            diff = run_git(
-                ["git", "diff", "--name-only", f"{base_ref_for_diff}..HEAD", "--"],
-                cwd=repo_path
+    diff = None
+
+    # ⭐ Essai 1 : three-dot (nécessite un merge base)
+    diff = _try_diff(repo_path, base_ref_for_diff, "...")
+
+    # ⭐ Essai 2 : si "no merge base" → two-dot (ne nécessite pas d'ancêtre commun)
+    if diff is None:
+        logger.warning("⚠️ Three-dot diff échoué (no merge base?) — essai two-dot...")
+        diff = _try_diff(repo_path, base_ref_for_diff, "..")
+
+    # ⭐ Essai 3 : deepen l'historique et réessayer
+    if diff is None:
+        logger.warning("⚠️ Two-dot diff échoué — approfondissement de l'historique (--deepen=500)...")
+        try:
+            run_git(["git", "fetch", "--deepen=500", "origin", base_ref], cwd=repo_path, check=False)
+            run_git(["git", "fetch", "--deepen=500", "origin", "HEAD"], cwd=repo_path, check=False)
+        except Exception:
+            pass
+        diff = _try_diff(repo_path, base_ref_for_diff, "...")
+        if diff is None:
+            diff = _try_diff(repo_path, base_ref_for_diff, "..")
+
+    # ⭐ Essai 4 : fallback ultime — tous les fichiers .kt modifiés localement
+    if diff is None:
+        logger.warning("⚠️ Tous les diff ont échoué — fallback: fichiers .kt avec status git")
+        try:
+            status = run_git(["git", "status", "--short"], cwd=repo_path, check=False)
+            diff = "\n".join(
+                line.split()[-1] for line in status.splitlines()
+                if line.strip().endswith(".kt")
             )
+            logger.info(f"  Fallback status: '{diff[:200]}'")
+        except Exception as e:
+            logger.error(f"Fallback status échoué: {e}")
+            diff = ""
 
-        files = [f for f in diff.splitlines() if f.strip().endswith(".kt")]
-        logger.info(f"📝 {len(files)} fichiers .kt trouvés: {files[:5]}")
-        return files[:MAX_FILES]
-
-    except Exception as e:
-        logger.error(f"Erreur git diff: {e}")
+    if not diff:
+        logger.info("Aucun fichier .kt modifié trouvé")
         return []
+
+    files = [f for f in diff.splitlines() if f.strip().endswith(".kt")]
+    logger.info(f"📝 {len(files)} fichiers .kt trouvés: {files[:5]}")
+    return files[:MAX_FILES]
 
 
 # ================= GROQ =================
@@ -200,15 +272,11 @@ def detect_truncation(code: str) -> bool:
 
 
 def check_chunk_non_log_loss(original: str, refactored: str, chunk_index: int) -> tuple[bool, str]:
-    """
-    Vérifie uniquement les lignes NON-LOG.
-    Les logs peuvent diminuer par déduplication — c'est normal.
-    """
     orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
     new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
 
-    orig_log = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
-    new_log  = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
+    orig_log   = sum(1 for l in original.splitlines()   if l.strip() and is_log_related(l))
+    new_log    = sum(1 for l in refactored.splitlines() if l.strip() and is_log_related(l))
     orig_total = len([l for l in original.splitlines()   if l.strip()])
     new_total  = len([l for l in refactored.splitlines() if l.strip()])
 
@@ -272,8 +340,6 @@ def build_chunk_prompt(is_retry: bool = False) -> str:
         " - AppSTLogger.appendLogST(STLevelLog.WARN, ..)   -> AppLogger.w(tag, msg)\n"
         " - AppSTLogger.appendLogST(STLevelLog.ERROR, ..)  -> AppLogger.e(tag, msg)\n\n"
 
-        "DEDUPLICATION: merge consecutive AppLogger calls with identical tag+message into one.\n\n"
-
         "IMPORTS (first fragment only):\n"
         " - ADD:    import com.honeywell.domain.managers.loggerApp.AppLogger\n"
         " - REMOVE: android.util.Log, Logr, STLevelLog, AppSTLogger imports\n\n"
@@ -334,8 +400,7 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
         data   = resp.json()
         choice = data["choices"][0]
 
-        finish_reason = choice.get("finish_reason", "")
-        if finish_reason == "length":
+        if choice.get("finish_reason") == "length":
             logger.warning(f"  ⚠️ {label}: finish_reason=length — réponse coupée par max_tokens")
 
         content = choice["message"]["content"]
@@ -349,11 +414,8 @@ def call_groq(code: str, chunk_index: Optional[int] = None, is_retry: bool = Fal
 # ================= VALIDATION FINALE =================
 
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
-    orig_lines   = original.splitlines()
-    new_lines    = refactored.splitlines()
-
-    orig_non_log = [l.strip() for l in orig_lines if l.strip() and not is_log_related(l)]
-    new_non_log  = [l.strip() for l in new_lines  if l.strip() and not is_log_related(l)]
+    orig_non_log = [l.strip() for l in original.splitlines()   if l.strip() and not is_log_related(l)]
+    new_non_log  = [l.strip() for l in refactored.splitlines() if l.strip() and not is_log_related(l)]
 
     if orig_non_log == new_non_log:
         logger.info("✅ Validation finale OK — code non-log identique")
@@ -364,7 +426,6 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
     added    = new_set  - orig_set
     removed  = orig_set - new_set
 
-    # Tolérance globale : max 2 lignes non-log différentes sur tout le fichier
     if len(added) <= 2 and len(removed) <= 2:
         for line in list(added)[:2]:
             logger.warning(f"  Ligne ajoutée:    '{line[:80]}'")
@@ -388,19 +449,12 @@ def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple
 # ================= REFACTOR =================
 
 def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
-    """
-    Envoie un chunk à Groq.
-    ⭐ Les chunks triviaux (< MIN_CHUNK_SIZE_FOR_CHECKS chars) passent sans validation
-       pour éviter les faux positifs sur des `}` ou fins de fichier.
-    """
     result = call_groq(chunk, chunk_index=chunk_index)
 
-    # ⭐ Chunk trivial : pas de validation (faux positifs garantis)
     if len(chunk.strip()) < MIN_CHUNK_SIZE_FOR_CHECKS:
         logger.info(f"  ✅ Chunk {chunk_index}/{total}: trivial ({len(chunk)} chars) — pas de validation")
         return result
 
-    # Check 1 : marqueurs de troncature explicites
     if detect_truncation(result):
         logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: troncature détectée — retry...")
         time.sleep(REQUEST_DELAY)
@@ -408,7 +462,6 @@ def refactor_chunk_with_retry(chunk: str, chunk_index: int, total: int) -> str:
         if detect_truncation(result):
             raise Exception(f"Chunk {chunk_index}/{total}: troncature persistante après retry")
 
-    # Check 2 : perte de lignes NON-LOG uniquement
     ok, reason = check_chunk_non_log_loss(chunk, result, chunk_index)
     if not ok:
         logger.warning(f"  ⚠️ Chunk {chunk_index}/{total}: perte code métier — retry...")
@@ -453,7 +506,6 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     )
                     return f"{filepath} - error (chunk {i+1}/{total}): {str(chunk_err)[:120]}"
 
-                # ⭐ Délai progressif plafonné à MAX_INTER_CHUNK_DELAY
                 if i < total - 1:
                     delay = min(REQUEST_DELAY * (i + 1), MAX_INTER_CHUNK_DELAY)
                     logger.info(f"  Pause {delay}s avant chunk suivant...")
@@ -472,7 +524,10 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             new_code = result
             time.sleep(REQUEST_DELAY)
 
-        # Validation finale sur le fichier complet
+        # Déduplication Python — fiable, indépendante du LLM
+        new_code = deduplicate_applogger(new_code)
+
+        # Validation finale
         valid, reason = validate_refactoring(original_code, new_code, filepath)
         if not valid:
             logger.error(f"🚫 Refactoring rejeté pour {filepath}: {reason}")
@@ -541,7 +596,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "12.0-stable",
+        "version": "14.0-stable",
         "groq_model": GROQ_MODEL
     }
 
@@ -553,11 +608,11 @@ def health():
         "groq_model": GROQ_MODEL,
         "chunk_size": CHUNK_SIZE,
         "max_tokens_out": MAX_TOKENS_OUT,
+        "clone_depth": CLONE_DEPTH,
         "max_workers": MAX_WORKERS,
         "request_delay": REQUEST_DELAY,
         "max_retries": MAX_RETRIES,
         "rate_limit_base_wait": RATE_LIMIT_BASE_WAIT,
         "max_inter_chunk_delay": MAX_INTER_CHUNK_DELAY,
-        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX,
-        "min_chunk_size_for_checks": MIN_CHUNK_SIZE_FOR_CHECKS
+        "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
     }
