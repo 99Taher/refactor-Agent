@@ -1,265 +1,336 @@
-name: AI Logger Refactor avec Notifications
+import os
+import re
+import sys
+import time
+import shutil
+import logging
+import requests
+import subprocess
+from pathlib import Path
+from typing import List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
 
-on:
-  push:
-    branches:
-      - test
-      - develop
-      - feature/**
-  pull_request:
-    types: [opened, synchronize, reopened]
+# ================= CONFIG =================
 
-jobs:
-  refactor:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
+MAX_FILES = 10
+MAX_WORKERS = 1
+GROQ_TIMEOUT = 30
+CLONE_DEPTH = 200
+MAX_FILE_SIZE = 50000
+REQUEST_DELAY = 2
+MAX_RETRIES = 3
+CHUNK_SIZE = 25000
 
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-      - name: 🔍 Détecter fichiers Kotlin modifiés
-        id: detect_files
-        run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            BASE_REF="${{ github.event.pull_request.base.ref }}"
-            HEAD_REF="${{ github.event.pull_request.head.ref }}"
-            echo "base_ref=$BASE_REF" >> $GITHUB_OUTPUT
-            echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
-            echo "📍 PR: Base=$BASE_REF, Head=$HEAD_REF"
-            git fetch origin "$BASE_REF"
-            CHANGED_FILES=$(git diff --name-only origin/$BASE_REF...HEAD | grep '\.kt$' || true)
-          else
-            HEAD_REF="${{ github.ref_name }}"
-            echo "base_ref=HEAD^" >> $GITHUB_OUTPUT
-            echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
-            echo "📍 Push sur: $HEAD_REF"
-            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | grep '\.kt$' || true)
-          fi
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+API_SECRET = os.getenv("API_SECRET")
 
-          if [ -z "$CHANGED_FILES" ]; then
-            echo "kt_count=0" >> $GITHUB_OUTPUT
-            echo "✅ Aucun fichier Kotlin modifié"
-          else
-            KT_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
-            echo "kt_count=$KT_COUNT" >> $GITHUB_OUTPUT
-            echo "📝 $KT_COUNT fichiers Kotlin modifiés:"
-            echo "$CHANGED_FILES"
-            echo "$CHANGED_FILES" > /tmp/changed_files.txt
-          fi
+# ==========================================
 
-      - name: 🔥 Réveiller le service Render
-        if: steps.detect_files.outputs.kt_count > 0
-        run: |
-          echo "🌐 Vérification du service Render..."
-          HEALTH_CODE=$(curl -s -w "%{http_code}" -o /dev/null --max-time 15 \
-            https://refactor-agent.onrender.com/health || echo "000")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
-          if [ "$HEALTH_CODE" == "200" ]; then
-            echo "✅ Service déjà actif"
-          else
-            echo "🔄 Service en hibernation, réveil en cours..."
-            for i in 1 2 3; do
-              echo "⏰ Tentative $i/3 (attente 15s)..."
-              sleep 15
-              HEALTH_CODE=$(curl -s -w "%{http_code}" -o /dev/null --max-time 20 \
-                https://refactor-agent.onrender.com/health || echo "000")
-              if [ "$HEALTH_CODE" == "200" ]; then
-                echo "✅ Service réveillé!"
-                break
-              fi
-            done
-          fi
+logger = logging.getLogger(__name__)
+app = FastAPI()
 
-      - name: 🤖 Appeler Refactor Agent API
-        id: refactor
-        if: steps.detect_files.outputs.kt_count > 0
-        run: |
-          START_TIME=$(date +%s)
 
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            API_BASE_REF="${{ steps.detect_files.outputs.base_ref }}"
-          else
-            API_BASE_REF="feature/centralized-logging-system"
-          fi
+class RefactorRequest(BaseModel):
+    repo_url: str
+    base_ref: str = "main"
+    branch: str = "auto-refactor"
 
-          echo "🚀 Envoi requête de refactoring..."
-          echo "📍 Base: $API_BASE_REF, Branch: ${{ steps.detect_files.outputs.head_ref }}"
 
-          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/response.json \
-            --max-time 900 \
-            --connect-timeout 60 \
-            --retry 3 \
-            --retry-delay 30 \
-            --retry-max-time 1200 \
-            -X POST "https://refactor-agent.onrender.com/refactor" \
-            -H "Content-Type: application/json" \
-            -H "X-API-Key: ${{ secrets.REFACTOR_API_SECRET }}" \
-            -d "{
-              \"repo_url\": \"${{ github.event.repository.clone_url }}\",
-              \"base_ref\": \"$API_BASE_REF\",
-              \"branch\": \"${{ steps.detect_files.outputs.head_ref }}\"
-            }")
+# ================= UTIL =================
 
-          END_TIME=$(date +%s)
-          DURATION=$((END_TIME - START_TIME))
+def run_git(cmd: List[str], cwd=None, check=True):
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise Exception(result.stderr.strip() or result.stdout.strip())
+    return result.stdout.strip()
 
-          echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
-          echo "duration=$DURATION" >> $GITHUB_OUTPUT
-          echo "📊 Code HTTP: $HTTP_CODE"
-          echo "⏱️  Durée: ${DURATION}s"
 
-          if [ -f /tmp/response.json ]; then
-            echo "📄 Réponse API:"
-            cat /tmp/response.json | jq '.' 2>/dev/null || cat /tmp/response.json
-          fi
+def split_code(code: str) -> List[str]:
+    chunks = []
+    start = 0
+    while start < len(code):
+        end = min(start + CHUNK_SIZE, len(code))
+        if end < len(code):
+            split = code.rfind("\nfun ", start, end)
+            if split != -1 and split > start:
+                end = split
+        chunks.append(code[start:end])
+        start = end
+    return chunks
 
-          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "✅ Refactoring terminé avec succès"
-            echo "success=true" >> $GITHUB_OUTPUT
 
-            # ⭐ FIX: Vérifier processed_files avant de parser
-            HAS_FILES=$(cat /tmp/response.json | jq 'has("processed_files")' 2>/dev/null || echo "false")
+# ================= GIT =================
 
-            if [ "$HAS_FILES" == "true" ]; then
-              PROCESSED=$(cat /tmp/response.json | jq -r '.processed_files[]' 2>/dev/null || echo "")
-              echo "$PROCESSED" > /tmp/processed_files.txt
+def clone_repo(repo_url: str, branch: str) -> Path:
+    if not repo_url.startswith("https://"):
+        raise HTTPException(400, "repo_url must be https")
 
-              if [ -n "$PROCESSED" ]; then
-                SUCCESS_COUNT=$(echo "$PROCESSED" | grep -c "refactored" 2>/dev/null || echo "0")
-                FAILED_COUNT=$(echo "$PROCESSED" | grep -cE "rate limit|error|trop gros" 2>/dev/null || echo "0")
-              else
-                SUCCESS_COUNT=0
-                FAILED_COUNT=0
-              fi
-            else
-              API_MSG=$(cat /tmp/response.json | jq -r '.message // .status // "terminé"' 2>/dev/null || echo "terminé")
-              echo "ℹ️  Message: $API_MSG"
-              echo "" > /tmp/processed_files.txt
-              SUCCESS_COUNT=0
-              FAILED_COUNT=0
-            fi
+    repo_name = repo_url.split("/")[-1].replace(".git", "")
+    repo_path = Path(repo_name)
 
-            # ⭐ FIX: Valeurs toujours définies
-            echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
-            echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Échec du refactoring (HTTP $HTTP_CODE)"
-            echo "success=false" >> $GITHUB_OUTPUT
-            echo "success_count=0" >> $GITHUB_OUTPUT
-            echo "failed_count=0" >> $GITHUB_OUTPUT
+    # ⭐ FIX: Nettoyer le dossier existant
+    if repo_path.exists():
+        shutil.rmtree(repo_path)
 
-            if [ "$HTTP_CODE" == "502" ] || [ "$HTTP_CODE" == "503" ]; then
-              echo "⚠️  Service en cours de démarrage - Attendre 2 min et relancer"
-            fi
-            exit 1
-          fi
+    clone_url = repo_url.replace("https://", f"https://{GITHUB_TOKEN}@")
 
-      - name: 💬 Commenter sur la PR - Succès
-        if: success() && github.event_name == 'pull_request' && steps.refactor.outputs.success == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
+    logger.info("Cloning repository...")
+    run_git([
+        "git", "clone",
+        "--depth", str(CLONE_DEPTH),
+        "--no-single-branch",  # ⭐ FIX: Récupérer toutes les branches
+        "-b", branch,
+        clone_url,
+        repo_name
+    ])
 
-            let processedFiles = '';
-            try {
-              processedFiles = fs.readFileSync('/tmp/processed_files.txt', 'utf8');
-            } catch (e) {
-              processedFiles = '';
-            }
+    return repo_path
 
-            const successCount = parseInt('${{ steps.refactor.outputs.success_count }}') || 0;
-            const failedCount = parseInt('${{ steps.refactor.outputs.failed_count }}') || 0;
-            const totalCount = parseInt('${{ steps.detect_files.outputs.kt_count }}') || 0;
-            const duration = parseInt('${{ steps.refactor.outputs.duration }}') || 0;
-            const successRate = totalCount > 0 ? Math.round((successCount / totalCount) * 100) : 0;
 
-            let statusEmoji = successRate >= 80 ? '✅' : successRate >= 50 ? '⚠️' : '❌';
+def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
+    logger.info(f"Detecting changed files (base={base_ref})...")
 
-            const lines = processedFiles.split('\n').filter(l => l.trim());
-            let resultsTable = '';
-            if (lines.length > 0) {
-              resultsTable = '**📝 Détail des fichiers:**\n\n| Fichier | Status |\n|---------|--------|\n';
-              lines.forEach(line => {
-                const match = line.match(/(.+?) → (.+)/);
-                if (match) {
-                  const shortFile = match[1].split('/').slice(-2).join('/');
-                  const status = match[2];
-                  let emoji = status.includes('refactored') ? '✅' :
-                               status.includes('rate limit') ? '⏳' :
-                               status.includes('trop gros') ? '📦' : '❌';
-                  resultsTable += '| `' + shortFile + '` | ' + emoji + ' ' + status + ' |\n';
-                }
-              });
-              resultsTable += '\n';
-            } else {
-              resultsTable = '**ℹ️  Aucun fichier .kt modifié détecté par l\'API**\n\n';
-            }
+    # ⭐ FIX: Fetch explicitement la branche base
+    try:
+        run_git([
+            "git", "fetch", "origin",
+            f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}",
+            f"--depth={CLONE_DEPTH}"
+        ], cwd=repo_path)
+        logger.info(f"✅ Branch origin/{base_ref} fetched")
+    except Exception as e:
+        logger.warning(f"⚠️ Fetch direct échoué: {e}")
+        # Fallback: fetch --all
+        try:
+            run_git(["git", "fetch", "--all", f"--depth={CLONE_DEPTH}"], cwd=repo_path)
+        except Exception:
+            pass
 
-            const comment = '## ' + statusEmoji + ' Refactoring Automatique - Résultat\n\n' +
-              '**📊 Statistiques:**\n' +
-              '- ✅ Succès: **' + successCount + '/' + totalCount + '** fichiers (' + successRate + '%)\n' +
-              '- ❌ Échecs: **' + failedCount + '** fichiers\n' +
-              '- ⏱️ Durée: **' + duration + 's**\n' +
-              '- 🤖 Modèle: `llama-3.3-70b-versatile`\n\n' +
-              resultsTable +
-              '**🔗 Liens:**\n' +
-              '- [Logs du workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n' +
-              '---\n*🤖 Généré automatiquement par Refactor Agent v6*';
+    # Vérifier si la branche existe
+    branches_raw = run_git(["git", "branch", "-r"], cwd=repo_path, check=False)
+    branches = [b.strip() for b in branches_raw.splitlines()]
+    origin_branch = f"origin/{base_ref}"
 
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+    logger.info(f"Branches disponibles: {branches}")
 
-      - name: 💬 Commenter sur la PR - Échec
-        if: failure() && github.event_name == 'pull_request' && steps.detect_files.outputs.kt_count > 0
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const httpCode = '${{ steps.refactor.outputs.http_code }}' || 'N/A';
-            const duration = '${{ steps.refactor.outputs.duration }}' || 'N/A';
+    if origin_branch in branches:
+        base_ref_for_diff = origin_branch
+        logger.info(f"✅ Diff avec {origin_branch}")
+    else:
+        # ⭐ FIX: Fallback au merge-base plutôt que FETCH_HEAD
+        logger.warning(f"⚠️ Branch {origin_branch} non trouvée")
+        # Essayer avec origin/HEAD
+        if "origin/HEAD" in branches:
+            base_ref_for_diff = "origin/HEAD"
+            logger.info("Fallback: diff avec origin/HEAD")
+        else:
+            base_ref_for_diff = "HEAD^"
+            logger.info("Fallback: diff avec HEAD^")
 
-            let errorMessage = 'Erreur inconnue';
-            if (httpCode === '403') errorMessage = '🔐 API_SECRET incorrect';
-            else if (httpCode === '429') errorMessage = '⏳ Rate limit Groq - Attendre 1-2h';
-            else if (httpCode === '500') errorMessage = '🔧 Erreur serveur - Vérifier logs Render';
-            else if (httpCode === '502' || httpCode === '503') errorMessage = '🔄 Service Render en hibernation';
-            else if (httpCode === '28' || httpCode === '000') errorMessage = '⏱️ Timeout connexion';
+    try:
+        diff = run_git(
+            ["git", "diff", "--name-only", f"{base_ref_for_diff}...HEAD", "--"],
+            cwd=repo_path
+        )
+        if not diff:
+            logger.info("Aucun fichier modifié trouvé avec three-dot, essai two-dot...")
+            diff = run_git(
+                ["git", "diff", "--name-only", f"{base_ref_for_diff}..HEAD", "--"],
+                cwd=repo_path
+            )
 
-            const comment = '## ❌ Refactoring Automatique - Échec\n\n' +
-              '- 🔴 Code: `' + httpCode + '`\n' +
-              '- ⏱️ Durée: `' + duration + 's`\n' +
-              '- 🔍 Erreur: ' + errorMessage + '\n\n' +
-              '[Voir les logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n' +
-              '---\n*🤖 Refactor Agent v6*';
+        files = [f for f in diff.splitlines() if f.strip().endswith(".kt")]
+        logger.info(f"📝 {len(files)} fichiers .kt trouvés: {files[:5]}")
+        return files[:MAX_FILES]
 
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+    except Exception as e:
+        logger.error(f"Erreur git diff: {e}")
+        return []
 
-      - name: 📊 GitHub Actions Summary
-        if: always() && steps.detect_files.outputs.kt_count > 0
-        run: |
-          echo "# 🤖 Refactor Agent - Résumé" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.refactor.outputs.success }}" == "true" ]; then
-            echo "## ✅ Succès" >> $GITHUB_STEP_SUMMARY
-            echo "- **Fichiers:** ${{ steps.refactor.outputs.success_count }}/${{ steps.detect_files.outputs.kt_count }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **Durée:** ${{ steps.refactor.outputs.duration }}s" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "## ❌ Échec" >> $GITHUB_STEP_SUMMARY
-            echo "- **HTTP:** ${{ steps.refactor.outputs.http_code }}" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "*$(date -u '+%Y-%m-%d %H:%M:%S UTC')*" >> $GITHUB_STEP_SUMMARY
+
+# ================= GROQ =================
+
+def call_groq(code: str) -> str:
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    prompt = (
+        "You are a Kotlin Refactoring Expert.\n"
+        "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
+
+        "🚨 CRITICAL CONSTRAINT:\n"
+        " - DO NOT modify business logic.\n"
+        " - DO NOT change control flow (if, when, for, while, try/catch).\n"
+        " - DO NOT modify variable names.\n"
+        " - DO NOT modify function signatures.\n"
+        " - DO NOT add or remove methods.\n"
+        " - DO NOT change return values.\n"
+        " - DO NOT optimize code.\n"
+        " - ONLY refactor logging statements.\n\n"
+
+        "1. CONVERSION RULES:\n"
+        " - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg) -> AppLogger.i(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg) -> AppLogger.w(tag, msg)\n"
+        " - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
+
+        "2. DEDUPLICATION RULE (CRITICAL):\n"
+        " - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
+        " - Only merge if they are strictly identical and consecutive.\n\n"
+
+        "3. IMPORTS:\n"
+        " - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
+        " - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n"
+        " - Do not modify any other imports.\n\n"
+
+        "Return ONLY raw source code.\n"
+        "NO markdown.\n"
+        "NO explanations.\n"
+        "NO comments added.\n"
+        "Preserve formatting and indentation."
+    )
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": "Output raw code only."},
+            {"role": "user", "content": prompt + "\n\nCODE:\n" + code}
+        ],
+        "temperature": 0
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    for attempt in range(MAX_RETRIES):
+        resp = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
+
+        if resp.status_code == 429:
+            logger.warning(f"Rate limit (tentative {attempt+1}/{MAX_RETRIES}). Attente 10s...")
+            time.sleep(10)
+            continue
+
+        if resp.status_code != 200:
+            raise Exception(f"Groq error {resp.status_code}: {resp.text[:200]}")
+
+        content = resp.json()["choices"][0]["message"]["content"]
+        content = re.sub(r"```.*?\n", "", content)
+        content = content.replace("```", "")
+        return content.strip()
+
+    raise Exception("Max retries reached (rate limit)")
+
+
+# ================= REFACTOR =================
+
+def refactor_file(repo_path: Path, filepath: str) -> str:
+    full_path = repo_path / filepath
+
+    try:
+        code = full_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"{filepath} - erreur lecture: {e}"
+
+    if not any(x in code for x in ["Log.", "AppSTLogger", "Logr."]):
+        return f"{filepath} - skipped (pas de logs)"
+
+    if len(code) > MAX_FILE_SIZE:
+        logger.warning(f"⚠️ {filepath} trop gros ({len(code):,} chars), ignoré")
+        # ⭐ FIX: Retourner "trop gros" pour que le workflow le détecte
+        return f"{filepath} - trop gros ({len(code):,} chars)"
+
+    logger.info(f"🤖 Refactoring {filepath} ({len(code):,} chars)...")
+
+    try:
+        new_code = call_groq(code)
+        full_path.write_text(new_code, encoding="utf-8")
+        time.sleep(REQUEST_DELAY)
+        logger.info(f"✅ {filepath} refactorisé")
+        return f"{filepath} - refactored"
+
+    except Exception as e:
+        logger.error(f"❌ Erreur refactor {filepath}: {e}")
+        return f"{filepath} - error: {str(e)[:100]}"
+
+
+# ================= COMMIT =================
+
+def commit_and_push(repo_path: Path):
+    run_git(["git", "config", "user.name", "Refactor Bot"], cwd=repo_path)
+    run_git(["git", "config", "user.email", "bot@refactor.local"], cwd=repo_path)
+    run_git(["git", "add", "."], cwd=repo_path)
+
+    status = run_git(["git", "status", "--porcelain"], cwd=repo_path)
+    if not status:
+        logger.info("Nothing to commit.")
+        return
+
+    run_git(["git", "commit", "-m", "🤖 Auto refactor logs"], cwd=repo_path)
+    run_git(["git", "push"], cwd=repo_path)
+    logger.info("✅ Push successful.")
+
+
+# ================= API =================
+
+@app.post("/refactor")
+def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
+    if x_api_key != API_SECRET:
+        raise HTTPException(403, "Unauthorized")
+
+    if not GROQ_API_KEY or not GITHUB_TOKEN:
+        raise HTTPException(500, "Missing env vars")
+
+    repo_path = clone_repo(request.repo_url, request.branch)
+    files = get_changed_files(repo_path, request.base_ref)
+
+    if not files:
+        return {"status": "ok", "message": "No .kt changes", "processed_files": []}
+
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(refactor_file, repo_path, f): f for f in files}
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            logger.info(result)
+
+    if any("refactored" in r for r in results):
+        commit_and_push(repo_path)
+
+    # ⭐ FIX: Clé "processed_files" pour compatibilité workflow
+    return {
+        "status": "success",
+        "processed_files": results
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Refactor Agent API Active",
+        "version": "7.0-stable",
+        "groq_model": GROQ_MODEL
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "groq_model": GROQ_MODEL,
+        "max_workers": MAX_WORKERS,
+        "request_delay": REQUEST_DELAY
+    }
