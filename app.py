@@ -240,56 +240,56 @@ LOG_PATTERNS = re.compile(
     r"(Log\.[diwev]\(|Logr\.[diwev]\(|AppSTLogger\.appendLogST\(|AppLogger\.[diwev]\()"
 )
 
-def is_log_line(line: str) -> bool:
-    """Retourne True si la ligne est liée aux logs."""
+IMPORT_PATTERNS = re.compile(
+    r"^import\s+(android\.util\.Log|com\.honeywell.*[Ll]og|com\.st.*[Ll]og|.*Logr|.*STLevelLog|.*AppLogger|.*AppSTLogger)"
+)
+
+def is_log_related(line: str) -> bool:
+    """Retourne True si la ligne est liée aux logs ou imports de logs."""
     stripped = line.strip()
-    return bool(LOG_PATTERNS.search(stripped)) or any(imp in stripped for imp in [
-        "import android.util.Log",
-        "import com.honeywell",
-        "import com.st.model.log",
-        "AppSTLogger",
-        "STLevelLog",
-        "Logr",
-        "AppLogger",
-    ])
+    return bool(LOG_PATTERNS.search(stripped)) or bool(IMPORT_PATTERNS.match(stripped))
 
 def validate_refactoring(original: str, refactored: str, filepath: str) -> tuple[bool, str]:
     """
     Vérifie que le LLM n'a modifié QUE les lignes de logs.
-    Retourne (valide, message).
+    Compare les lignes non-log en ignorant les espaces.
     """
     orig_lines = original.splitlines()
     new_lines = refactored.splitlines()
 
-    # Tolérer une différence de ±5% de lignes (imports supprimés/ajoutés)
-    if abs(len(orig_lines) - len(new_lines)) > max(10, len(orig_lines) * 0.05):
-        msg = f"❌ REJETÉ: trop de lignes modifiées ({len(orig_lines)} → {len(new_lines)})"
-        logger.error(f"{filepath}: {msg}")
-        return False, msg
+    # Extraire uniquement les lignes NON-log (code métier)
+    orig_non_log = [l.strip() for l in orig_lines if l.strip() and not is_log_related(l)]
+    new_non_log  = [l.strip() for l in new_lines  if l.strip() and not is_log_related(l)]
 
-    # Comparer ligne par ligne les lignes NON-log
-    changed_non_log = []
-    max_len = max(len(orig_lines), len(new_lines))
-    padded_orig = orig_lines + [""] * (max_len - len(orig_lines))
-    padded_new = new_lines + [""] * (max_len - len(new_lines))
+    # Comparer les blocs de code non-log
+    if orig_non_log == new_non_log:
+        logger.info(f"✅ Validation OK — code non-log identique")
+        return True, "ok"
 
-    for i, (o, n) in enumerate(zip(padded_orig, padded_new)):
-        if o != n and not is_log_line(o) and not is_log_line(n):
-            changed_non_log.append((i + 1, o, n))
+    # Calculer les différences
+    orig_set = set(orig_non_log)
+    new_set  = set(new_non_log)
 
-    if changed_non_log:
-        # Afficher les 3 premières différences suspectes
-        for lineno, orig, new in changed_non_log[:3]:
-            logger.warning(f"  Ligne {lineno}: '{orig.strip()}' → '{new.strip()}'")
+    added   = new_set  - orig_set
+    removed = orig_set - new_set
 
-        # Bloquer si plus de 3 lignes non-log modifiées
-        if len(changed_non_log) > 3:
-            msg = f"❌ REJETÉ: {len(changed_non_log)} lignes non-log modifiées"
-            logger.error(f"{filepath}: {msg}")
-            return False, msg
+    # Tolérer les petites différences (max 2 lignes)
+    if len(added) <= 2 and len(removed) <= 2:
+        for line in list(added)[:2]:
+            logger.warning(f"  Ligne ajoutée:    '{line[:80]}'")
+        for line in list(removed)[:2]:
+            logger.warning(f"  Ligne supprimée:  '{line[:80]}'")
+        logger.info(f"✅ Validation OK — différences mineures tolérées ({len(added)} ajout(s), {len(removed)} suppression(s))")
+        return True, "ok"
 
-    logger.info(f"✅ Validation OK ({len(changed_non_log)} lignes non-log modifiées, dans la tolérance)")
-    return True, "ok"
+    # Bloquer si trop de différences
+    msg = f"❌ REJETÉ: {len(added)} lignes non-log ajoutées, {len(removed)} supprimées"
+    logger.error(f"{filepath}: {msg}")
+    for line in list(added)[:3]:
+        logger.error(f"  + '{line[:80]}'")
+    for line in list(removed)[:3]:
+        logger.error(f"  - '{line[:80]}'")
+    return False, msg
 
 
 # ================= REFACTOR =================
