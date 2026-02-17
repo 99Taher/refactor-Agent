@@ -17,13 +17,13 @@ MAX_FILES             = 10
 MAX_WORKERS           = 1
 GROQ_TIMEOUT          = 120
 CLONE_DEPTH           = 500
-REQUEST_DELAY         = 3         # ⬆️ 2 → 3 (pause entre chunks)
+REQUEST_DELAY         = 3
 MAX_RETRIES           = 5
-MAX_INTER_CHUNK_DELAY = 10        # ⬆️ 5 → 10 (max pause progressive)
+MAX_INTER_CHUNK_DELAY = 10
 
-CHUNK_SIZE            = 15000     # ⬇️ 35000 → 15000 (CRITIQUE)
-MAX_FILE_SIZE         = 60000     # ⬆️ 40000 → 60000 (traiter plus de fichiers)
-MAX_TOKENS_OUT        = 8000      # ⬇️ 32000 → 8000 (output plus court = plus rapide)
+CHUNK_SIZE            = 15000     # ✅ Reste à 15K
+MAX_FILE_SIZE         = 60000     # ✅ Traite gros fichiers
+MAX_TOKENS_OUT        = 16000     # ⬆️ 8000 → 16000 (CRITIQUE)
 
 RATE_LIMIT_BASE_WAIT  = 15
 MIN_CHUNK_SIZE_FOR_CHECKS = 100
@@ -31,7 +31,7 @@ MIN_CHUNK_SIZE_FOR_CHECKS = 100
 NON_LOG_DIFF_MAX_PER_CHUNK = 3
 NON_LOG_DIFF_MAX_FINAL     = 5
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET   = os.getenv("API_SECRET")
@@ -489,4 +489,5 @@ def health():
         "non_log_diff_max_per_chunk": NON_LOG_DIFF_MAX_PER_CHUNK,
         "non_log_diff_max_final": NON_LOG_DIFF_MAX_FINAL
     }
+
 
