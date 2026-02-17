@@ -16,16 +16,17 @@ from pydantic import BaseModel
 
 MAX_FILES        = 10
 MAX_WORKERS      = 1
-GROQ_TIMEOUT     = 60
+GROQ_TIMEOUT     = 120          # ⬆️  60  → 120  (chunks plus grands = plus de temps)
 CLONE_DEPTH      = 500
-REQUEST_DELAY    = 3
+REQUEST_DELAY    = 2            # ⬇️  3   → 2    (modèle plus rapide)
 MAX_RETRIES      = 5
-CHUNK_SIZE       = 8000
-MAX_FILE_SIZE    = 8000
-MAX_TOKENS_OUT   = 8000
-RATE_LIMIT_BASE_WAIT  = 15
-MAX_INTER_CHUNK_DELAY = 15
+MAX_INTER_CHUNK_DELAY = 5       # ⬇️  15  → 5
 
+CHUNK_SIZE       = 60000        # ⬆️  8K  → 60K  (≈15K tokens, safe pour 131K context)
+MAX_FILE_SIZE    = 200000       # ⬆️  8K  → 200K (plus aucun fichier ignoré)
+MAX_TOKENS_OUT   = 32000        # ⬆️  8K  → 32K  (output plus complet)
+
+RATE_LIMIT_BASE_WAIT      = 15
 MIN_CHUNK_SIZE_FOR_CHECKS = 100
 NON_LOG_LINE_LOSS_MAX     = 2
 
@@ -611,4 +612,5 @@ def health():
         "max_inter_chunk_delay": MAX_INTER_CHUNK_DELAY,
         "non_log_line_loss_max": NON_LOG_LINE_LOSS_MAX
     }
+
 
