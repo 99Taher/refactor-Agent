@@ -305,14 +305,20 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     if not any(x in original_code for x in ["Log.", "AppSTLogger", "Logr."]):
         return f"{filepath} - skipped (pas de logs)"
 
-    if len(original_code) > MAX_FILE_SIZE:
-        logger.warning(f"⚠️ {filepath} trop gros ({len(original_code):,} chars), ignoré")
-        return f"{filepath} - trop gros ({len(original_code):,} chars)"
-
     logger.info(f"🤖 Refactoring {filepath} ({len(original_code):,} chars)...")
 
     try:
-        new_code = call_groq(original_code)
+        # ⭐ Fichier grand → traitement par chunks
+        if len(original_code) > MAX_FILE_SIZE:
+            chunks = split_code(original_code)
+            logger.info(f"📦 Grand fichier: divisé en {len(chunks)} chunks")
+            new_code = ""
+            for i, chunk in enumerate(chunks):
+                logger.info(f"  Chunk {i+1}/{len(chunks)} ({len(chunk):,} chars)...")
+                new_code += call_groq(chunk)
+                time.sleep(REQUEST_DELAY)
+        else:
+            new_code = call_groq(original_code)
 
         # ⭐ VALIDATION: Vérifier que seuls les logs ont changé
         valid, reason = validate_refactoring(original_code, new_code, filepath)
