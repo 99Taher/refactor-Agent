@@ -135,6 +135,27 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
 
 # ================= GROQ =================
 
+def build_refactor_prompt(code: str) -> str:
+    prompt = (
+        "You are a Kotlin Refactoring Expert.\n"
+        "Your mission: Clean up and deduplicate logging in this Android code.\n\n"
+        "1. CONVERSION RULES:\n"
+        "   - Log.d/i/w/e OR Logr.d/i/w/e -> AppLogger.d/i/w/e(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.DEBUG, tag, msg) -> AppLogger.d(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.INFO, tag, msg)  -> AppLogger.i(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.WARN, tag, msg)  -> AppLogger.w(tag, msg)\n"
+        "   - AppSTLogger.appendLogST(STLevelLog.ERROR, tag, msg) -> AppLogger.e(tag, msg)\n\n"
+        "2. DEDUPLICATION RULE (CRITICAL):\n"
+        "   - Merge consecutive lines of AppLogger with EXACT SAME tag and message into ONE.\n"
+        "   - Example: Multiple AppLogger.e(MODULE, 'text') calls become just one.\n\n"
+        "3. IMPORTS:\n"
+        "   - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
+        "   - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
+        "Return ONLY raw source code. NO markdown markers, NO explanations."
+    )
+    return f"{prompt}\n\nKotlin file to refactor:\n{code}"
+
+
 def call_groq(code: str, is_retry=False) -> str:
     url = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -143,8 +164,8 @@ def call_groq(code: str, is_retry=False) -> str:
         "max_tokens": MAX_TOKENS_OUT,
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": "Return raw Kotlin code only."},
-            {"role": "user", "content": code}
+            {"role": "system", "content": "You are a Kotlin refactoring assistant. Return raw Kotlin code only, no markdown, no explanation."},
+            {"role": "user", "content": build_refactor_prompt(code)}  # FIX 1 appliqué ici
         ]
     }
 
@@ -189,6 +210,19 @@ def call_groq(code: str, is_retry=False) -> str:
 
 # ================= REFACTOR =================
 
+def needs_refactoring(code: str) -> bool:
+    """FIX 2 : détection élargie aux vrais patterns à migrer"""
+    patterns = [
+        "Log.d(",
+        "Log.e(",
+        "Log.w(",
+        "Log.i(",
+        "Log.v(",
+        "AppSTLogger",
+    ]
+    return any(p in code for p in patterns)
+
+
 def refactor_file(repo_path: Path, filepath: str) -> str:
     full_path = repo_path / filepath
 
@@ -197,8 +231,9 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     except Exception as e:
         return f"{filepath} - read error: {e}"
 
-    if "Log." not in original_code and "AppSTLogger" not in original_code:
-        return f"{filepath} - skipped"
+    # FIX 2 : filtre corrigé
+    if not needs_refactoring(original_code):
+        return f"{filepath} - skipped (no Log.x or AppSTLogger found)"
 
     logger.info(f"Refactoring {filepath}")
 
@@ -208,7 +243,13 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
         if not new_code or len(new_code) < 50:
             return f"{filepath} - rejected (empty result)"
 
+        # FIX 3 : vérifier que le code a vraiment changé
+        if new_code.strip() == original_code.strip():
+            logger.warning(f"{filepath} - LLM returned identical code, no change written")
+            return f"{filepath} - skipped (LLM made no changes)"
+
         full_path.write_text(new_code, encoding="utf-8")
+        logger.info(f"{filepath} - written successfully")
 
         return f"{filepath} - refactored"
 
@@ -266,7 +307,7 @@ def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
 def root():
     return {
         "message": "Refactor Agent API Active",
-        "version": "17.0-stable",
+        "version": "18.0-stable",
         "model": GROQ_MODEL,
     }
 
