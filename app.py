@@ -26,7 +26,7 @@ CHUNK_SIZE = 12000
 MAX_TOKENS_OUT = 8000
 RATE_LIMIT_BASE_WAIT = 15
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
@@ -558,3 +558,4 @@ def health():
         "model": GROQ_MODEL,
         "chunk_size": CHUNK_SIZE,
     }
+
