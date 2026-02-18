@@ -180,8 +180,6 @@ def call_groq_with_prompt(prompt: str) -> str:
         "model": GROQ_MODEL,
         "max_tokens": MAX_TOKENS_OUT,
         "temperature": 0,
-        # Disable visible chain-of-thought for reasoning models (e.g. Qwen3)
-        "thinking": {"type": "disabled"},
         "messages": [
             {
                 "role": "system",
