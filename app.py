@@ -22,8 +22,8 @@ GROQ_TIMEOUT = 120
 CLONE_DEPTH = 500
 REQUEST_DELAY = 2
 MAX_RETRIES = 5
-CHUNK_SIZE = 80000  # llama-3.3-70b-versatile: 128k context, safe chunk size
-MAX_TOKENS_OUT = 32000
+CHUNK_SIZE = 12000  # safe for Groq org token limits per request
+MAX_TOKENS_OUT = 8000  # safe for Groq org limits (input + output must stay under quota)
 RATE_LIMIT_BASE_WAIT = 15
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
