@@ -235,12 +235,14 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
     """
     if not llm_output:
         return False
-    # If output is less than 20% the size of the original, something went wrong
     if len(llm_output) < len(original) * 0.20:
         kotlin_tokens = ("fun ", "val ", "var ", "class ", "import ", "package ", "object ", "return ", "{", "}")
         if not any(t in llm_output for t in kotlin_tokens):
             return False
     return True
+
+
+def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
     """
     Single unified prompt sent for every chunk (full file or split piece).
     The LLM receives the raw Kotlin code and returns the fully refactored version.
