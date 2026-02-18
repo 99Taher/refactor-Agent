@@ -70,6 +70,8 @@ def run_git(cmd: List[str], cwd=None, check=True):
 def clean_llm_output(content: str) -> str:
     if not content:
         return ""
+    # Strip <think>...</think> blocks produced by reasoning models (e.g. Qwen3)
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
     content = re.sub(r"```kotlin", "", content, flags=re.IGNORECASE)
     content = re.sub(r"```", "", content)
     return content.strip()
@@ -178,6 +180,8 @@ def call_groq_with_prompt(prompt: str) -> str:
         "model": GROQ_MODEL,
         "max_tokens": MAX_TOKENS_OUT,
         "temperature": 0,
+        # Disable visible chain-of-thought for reasoning models (e.g. Qwen3)
+        "thinking": {"type": "disabled"},
         "messages": [
             {
                 "role": "system",
