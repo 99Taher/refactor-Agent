@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
+import threading
 
 
 # ================= CONFIG =================
@@ -350,29 +351,71 @@ def commit_and_push(repo_path: Path):
 
 # ================= API =================
 
+# Track running jobs
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+
+def run_refactor_job(job_id: str, request: RefactorRequest):
+    """Background job: clone, refactor, commit."""
+    try:
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "running", "files": []}
+
+        repo_path = clone_repo(request.repo_url, request.branch)
+        files = get_changed_files(repo_path, request.base_ref)
+
+        if not files:
+            with _jobs_lock:
+                _jobs[job_id] = {"status": "done", "files": [], "message": "No .kt changes"}
+            return
+
+        results = []
+        # Process files sequentially (MAX_WORKERS=1)
+        for f in files:
+            result = refactor_file(repo_path, f)
+            results.append(result)
+            with _jobs_lock:
+                _jobs[job_id]["files"] = results
+            logger.info(f"[{job_id}] {result}")
+
+        if any("refactored" in r for r in results):
+            commit_and_push(repo_path)
+
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "files": results}
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Job failed: {e}")
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "error", "error": str(e)}
+
+
 @app.post("/refactor")
-def run_refactor(request: RefactorRequest, x_api_key: str = Header(None)):
+def run_refactor(request: RefactorRequest, background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
     if x_api_key != API_SECRET:
         raise HTTPException(403, "Unauthorized")
     if not GROQ_API_KEY:
         raise HTTPException(500, "Missing GROQ_API_KEY")
 
-    repo_path = clone_repo(request.repo_url, request.branch)
-    files = get_changed_files(repo_path, request.base_ref)
+    job_id = f"job_{int(time.time())}"
+    background_tasks.add_task(run_refactor_job, job_id, request)
 
-    if not files:
-        return {"status": "ok", "message": "No .kt changes"}
+    return {"status": "started", "job_id": job_id, "message": "Refactoring running in background"}
 
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(refactor_file, repo_path, f) for f in files]
-        for future in as_completed(futures):
-            results.append(future.result())
 
-    if any("refactored" in r for r in results):
-        commit_and_push(repo_path)
+@app.get("/refactor/status/{job_id}")
+def get_status(job_id: str, x_api_key: str = Header(None)):
+    if x_api_key != API_SECRET:
+        raise HTTPException(403, "Unauthorized")
 
-    return {"status": "success", "processed_files": results}
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+
+    return {"job_id": job_id, **job}
 
 
 @app.get("/")
