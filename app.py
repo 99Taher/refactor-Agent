@@ -226,7 +226,21 @@ def call_groq_with_prompt(prompt: str) -> str:
 
 # ================= LLM PROMPT =================
 
-def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
+def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
+    """
+    Returns False if the LLM returned a prose explanation instead of Kotlin code.
+    Heuristics:
+      - Output is suspiciously short compared to input (< 20% of original length)
+      - Output does not contain any Kotlin-specific tokens
+    """
+    if not llm_output:
+        return False
+    # If output is less than 20% the size of the original, something went wrong
+    if len(llm_output) < len(original) * 0.20:
+        kotlin_tokens = ("fun ", "val ", "var ", "class ", "import ", "package ", "object ", "return ", "{", "}")
+        if not any(t in llm_output for t in kotlin_tokens):
+            return False
+    return True
     """
     Single unified prompt sent for every chunk (full file or split piece).
     The LLM receives the raw Kotlin code and returns the fully refactored version.
@@ -275,6 +289,9 @@ def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import
         "  - Preserve the EXACT indentation and formatting of every line.",
         "  - Do NOT touch any line that is not a log call or a relevant import.",
         "  - Do NOT add explanations, comments, or markdown — return raw Kotlin code only.",
+        "  - If there is NOTHING to convert or fix, return the code EXACTLY as received, character for character.",
+        "  - NEVER write sentences like 'No changes needed' or 'The code already uses AppLogger'.",
+        "  - Your response MUST always be valid Kotlin code, nothing else.",
         "",
         "CODE:",
         chunk,
@@ -311,6 +328,10 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             new_code = call_groq_with_prompt(prompt)
             n_chunks = 1
 
+            if not is_valid_kotlin_output(new_code, original_code):
+                logger.warning(f"{filepath} - LLM returned prose instead of code, keeping original")
+                return f"{filepath} - skipped (LLM returned explanation instead of code)"
+
         # ── Large file: split into chunks, refactor each, reassemble ──────────
         else:
             chunks = split_into_chunks(lines)
@@ -327,6 +348,11 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
                 result = call_groq_with_prompt(prompt)
+
+                if not is_valid_kotlin_output(result, chunk_text):
+                    logger.warning(f"{filepath} - chunk {i + 1} returned prose, keeping original chunk")
+                    result = chunk_text
+
                 refactored_parts.append(result)
 
                 if i < n_chunks - 1:
