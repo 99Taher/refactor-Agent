@@ -150,9 +150,17 @@ def build_refactor_prompt(code: str) -> str:
         "   - Example: Multiple AppLogger.e(MODULE, 'text') calls become just one.\n\n"
         "3. IMPORTS:\n"
         "   - ADD: 'import com.honeywell.domain.managers.loggerApp.AppLogger'.\n"
-        "   - REMOVE: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n\n"
+        "   - REMOVE ONLY: android.util.Log, Logr, STLevelLog, and AppSTLogger imports.\n"
+        "   - Do NOT remove or modify ANY other import that is not log-related.\n\n"
+        "4. STRICT PRESERVATION RULES (CRITICAL - DO NOT VIOLATE):\n"
+        "   - Do NOT change ANY line of code that is not a log call or a log-related import.\n"
+        "   - Do NOT reformat, reorder, rename, or restructure anything.\n"
+        "   - Do NOT modify comments, blank lines, indentation, or spacing.\n"
+        "   - Do NOT touch business logic, function signatures, class structure, or variables.\n"
+        "   - The only allowed changes are: log call conversions, deduplication, and imports.\n"
+        "   - If a line is not a log call, copy it EXACTLY as-is, character by character.\n\n"
         "Return ONLY raw source code. NO markdown markers, NO explanations."
-    )
+     )
     return f"{prompt}\n\nKotlin file to refactor:\n{code}"
 
 
@@ -333,3 +341,4 @@ def health():
         "max_file_size": MAX_FILE_SIZE,
         "chunk_size": CHUNK_SIZE,
     }
+
