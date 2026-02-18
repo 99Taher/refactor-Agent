@@ -433,4 +433,6 @@ def health():
         "status": "healthy",
         "model": GROQ_MODEL,
         "chunk_size": CHUNK_SIZE,
+        
     }
+
