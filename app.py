@@ -32,7 +32,7 @@ MIN_CHUNK_SIZE_FOR_CHECKS = 100
 NON_LOG_DIFF_MAX_PER_CHUNK = 3
 NON_LOG_DIFF_MAX_FINAL = 5
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET = os.getenv("API_SECRET")
@@ -130,7 +130,7 @@ def get_changed_files(repo_path: Path, base_ref: str) -> List[str]:
     files = [f for f in diff.splitlines() if f.endswith(".kt")]
     logger.info(f"{len(files)} Kotlin files found")
 
-    return files[:MAX_FILES]
+    return files
 
 
 # ================= GROQ =================
@@ -211,16 +211,29 @@ def call_groq(code: str, is_retry=False) -> str:
 # ================= REFACTOR =================
 
 def needs_refactoring(code: str) -> bool:
-    """FIX 2 : détection élargie aux vrais patterns à migrer"""
-    patterns = [
-        "Log.d(",
-        "Log.e(",
-        "Log.w(",
-        "Log.i(",
-        "Log.v(",
+    """Détection de tous les patterns nécessitant un refactoring"""
+
+    # Pattern 1 : appels android.util.Log.x à migrer
+    log_patterns = [
+        "Log.d(", "Log.e(", "Log.w(", "Log.i(", "Log.v(",
+        # Logr (mentionné dans le prompt mais absent du filtre initial)
+        "Logr.d(", "Logr.e(", "Logr.w(", "Logr.i(", "Logr.v(",
+        # AppSTLogger à migrer
         "AppSTLogger",
     ]
-    return any(p in code for p in patterns)
+    if any(p in code for p in log_patterns):
+        return True
+
+    # Pattern 2 : doublons AppLogger consécutifs à dédupliquer
+    lines = [l.strip() for l in code.splitlines()]
+    for i in range(len(lines) - 1):
+        if (
+            lines[i].startswith("AppLogger.")
+            and lines[i] == lines[i + 1]
+        ):
+            return True
+
+    return False
 
 
 def refactor_file(repo_path: Path, filepath: str) -> str:
