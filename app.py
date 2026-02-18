@@ -36,6 +36,7 @@ LOG_PREFIXES = (
     "Log.d(", "Log.i(", "Log.w(", "Log.e(", "Log.v(",
     "Logr.d(", "Logr.i(", "Logr.w(", "Logr.e(", "Logr.v(",
     "AppSTLogger.appendLogST(",
+    "AppLogger.",  # include already-converted lines for deduplication
 )
 
 IMPORT_PREFIXES_TO_REMOVE = (
