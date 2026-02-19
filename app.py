@@ -22,8 +22,8 @@ GROQ_TIMEOUT = 120
 CLONE_DEPTH = 500
 REQUEST_DELAY = 10
 MAX_RETRIES = 8
-CHUNK_SIZE = 12000        # chars — files above this are split into chunks
-MAX_TOKENS_OUT = 8000
+CHUNK_SIZE = 30000       # ~30k chars ≈ ~9,000–10,000 tokens input → well under 128K
+MAX_TOKENS_OUT = 12000
 RATE_LIMIT_BASE_WAIT = 15
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
@@ -473,3 +473,4 @@ def health():
         "model": GROQ_MODEL,
         "chunk_size": CHUNK_SIZE,
     }
+
