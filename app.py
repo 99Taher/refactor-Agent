@@ -82,7 +82,7 @@ def _build_model_list() -> list:
         models.append({
             "model_name": "llm",
             "litellm_params": {
-                "model":   os.getenv("OPENROUTER_MODEL", "openrouter/meta-llama/llama-3.3-70b-instruct:free"),
+                "model":   os.getenv("OPENROUTER_MODEL", "openrouter/openrouter/free"),
                 "api_key": os.getenv("OPENROUTER_API_KEY"),
             }
         })
@@ -532,4 +532,5 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
