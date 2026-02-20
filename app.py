@@ -4,32 +4,26 @@ import sys
 import time
 import shutil
 import logging
-import requests
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List
 
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
+from litellm import Router
+import litellm
 import threading
 
 
 # ================= CONFIG =================
 
-MAX_WORKERS = 1
-GROQ_TIMEOUT = 120
-CLONE_DEPTH = 500
-REQUEST_DELAY = 10
-MAX_RETRIES = 8
-CHUNK_SIZE = 30000       # ~30k chars ≈ ~9,000–10,000 tokens input → well under 128K
+CLONE_DEPTH    = 500
+REQUEST_DELAY  = 10
+CHUNK_SIZE     = 30000   # ~30k chars ≈ ~9,000–10,000 tokens input
 MAX_TOKENS_OUT = 12000
-RATE_LIMIT_BASE_WAIT = 15
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-API_SECRET = os.getenv("API_SECRET")
+API_SECRET   = os.getenv("API_SECRET")
 
 # Quick-scan prefixes to decide whether a file needs refactoring at all
 LOG_PREFIXES = (
@@ -41,6 +35,94 @@ LOG_PREFIXES = (
 APPLOGGER_IMPORT = "import com.honeywell.domain.managers.loggerApp.AppLogger"
 
 # ==========================================
+# ================= LLM ROUTER =============
+# ==========================================
+#
+# Render environment variables to set:
+# ┌─────────────────────────┬──────────────────────────────────────────────────┐
+# │ Variable                │ Value                                            │
+# ├─────────────────────────┼──────────────────────────────────────────────────┤
+# │ GROQ_API_KEY            │ gsk_...          (get at console.groq.com)       │
+# │ GROQ_MODEL              │ groq/qwen/qwen3-32b          (optional)          │
+# │ OPENROUTER_API_KEY      │ sk-or-...        (get at openrouter.ai)          │
+# │ OPENROUTER_MODEL        │ openrouter/deepseek/deepseek-r1:free  (optional) │
+# │ HUGGINGFACE_API_KEY     │ hf_...           (get at huggingface.co)         │
+# │ HUGGINGFACE_MODEL       │ huggingface/Qwen/Qwen2.5-72B-Instruct (optional) │
+# │ GITHUB_TOKEN            │ ghp_...                                          │
+# │ API_SECRET              │ your_secret                                      │
+# └─────────────────────────┴──────────────────────────────────────────────────┘
+#
+# The Router switches providers automatically when:
+#   - Rate limit hit (429)  → cooldown provider 60s, try next immediately
+#   - Timeout               → retry 3x then switch to next provider
+#   - API down (5xx)        → switch to next provider immediately
+#   - Auth error (401)      → skip that provider entirely for the whole job
+
+
+def _build_model_list() -> list:
+    """
+    Builds provider list from env vars.
+    Only includes providers whose API key is actually set.
+    Order = priority: first entry is tried first.
+    """
+    models = []
+
+    # ── 1. Groq (primary — fastest, 14,400 req/day free) ─────────
+    if os.getenv("GROQ_API_KEY"):
+        models.append({
+            "model_name": "llm",
+            "litellm_params": {
+                "model":   os.getenv("GROQ_MODEL", "groq/qwen/qwen3-32b"),
+                "api_key": os.getenv("GROQ_API_KEY"),
+            }
+        })
+
+    # ── 2. OpenRouter (fallback 1 — 300+ models, free tier) ──────
+    if os.getenv("OPENROUTER_API_KEY"):
+        models.append({
+            "model_name": "llm",
+            "litellm_params": {
+                "model":   os.getenv("OPENROUTER_MODEL", "openrouter/deepseek/deepseek-r1:free"),
+                "api_key": os.getenv("OPENROUTER_API_KEY"),
+            }
+        })
+
+    # ── 3. Hugging Face (fallback 2 — free inference API) ────────
+    if os.getenv("HUGGINGFACE_API_KEY"):
+        models.append({
+            "model_name": "llm",
+            "litellm_params": {
+                "model":   os.getenv("HUGGINGFACE_MODEL", "huggingface/Qwen/Qwen2.5-72B-Instruct"),
+                "api_key": os.getenv("HUGGINGFACE_API_KEY"),
+            }
+        })
+
+    return models
+
+
+_model_list = _build_model_list()
+
+if not _model_list:
+    raise RuntimeError(
+        "No LLM provider configured. "
+        "Set at least one of: GROQ_API_KEY, OPENROUTER_API_KEY, HUGGINGFACE_API_KEY."
+    )
+
+# Router handles retries, fallbacks, rate limits and timeouts automatically
+router = Router(
+    model_list=_model_list,
+    num_retries=3,          # retry same provider N times before switching
+    retry_after=5,          # seconds between retries on same provider
+    timeout=60,             # switch provider after this many seconds
+    cooldown_time=60,       # cooldown a provider after rate limit (seconds)
+    routing_strategy="simple-shuffle",
+    set_verbose=False,
+)
+
+# Silence LiteLLM internal logs
+litellm.suppress_debug_info = True
+
+# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,13 +131,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_active_providers = [m["litellm_params"]["model"] for m in _model_list]
+logger.info(f"LLM Router initialized with {len(_model_list)} provider(s): {_active_providers}")
+
 app = FastAPI()
 
 
 class RefactorRequest(BaseModel):
     repo_url: str
     base_ref: str = "main"
-    branch: str = "auto-refactor"
+    branch:   str = "auto-refactor"
 
 
 # ================= UTIL =================
@@ -100,7 +185,7 @@ def clone_repo(repo_url: str, branch: str) -> Path:
         "--no-single-branch",
         "-b", branch,
         clone_url,
-        repo_name
+        repo_name,
     ])
 
     return repo_path
@@ -135,7 +220,6 @@ def needs_refactoring(code: str) -> bool:
     for prefix in LOG_PREFIXES:
         if prefix in code:
             return True
-    # Detect duplicate consecutive AppLogger lines
     lines = code.splitlines()
     for i in range(len(lines) - 1):
         s = lines[i].strip()
@@ -171,57 +255,30 @@ def split_into_chunks(lines: List[str]) -> List[List[str]]:
     return chunks
 
 
-# ================= GROQ =================
+# ================= LLM CALL =================
 
-def call_groq_with_prompt(prompt: str) -> str:
-    url = "https://api.groq.com/openai/v1/chat/completions"
-
-    payload = {
-        "model": GROQ_MODEL,
-        "max_tokens": MAX_TOKENS_OUT,
-        "temperature": 0,
-        "messages": [
+def call_llm(prompt: str) -> str:
+    """
+    Single entry point for all LLM calls.
+    The Router automatically handles retries, provider switching,
+    rate limit cooldowns and timeouts — no manual retry loop needed.
+    """
+    response = router.completion(
+        model="llm",            # alias — Router picks the actual provider
+        temperature=0,
+        max_tokens=MAX_TOKENS_OUT,
+        messages=[
             {
                 "role": "system",
                 "content": (
                     "You are a Kotlin log-refactoring assistant. "
                     "Follow instructions exactly. Return only what is asked."
-                )
+                ),
             },
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=GROQ_TIMEOUT)
-
-            if response.status_code == 429:
-                wait = min(RATE_LIMIT_BASE_WAIT * (2 ** attempt), 90)
-                logger.warning(f"Rate limited. Waiting {wait}s...")
-                time.sleep(wait)
-                continue
-
-            if response.status_code != 200:
-                raise Exception(response.text)
-
-            data = response.json()
-            if "choices" not in data:
-                raise Exception("Invalid Groq response")
-
-            return clean_llm_output(data["choices"][0]["message"]["content"])
-
-        except requests.exceptions.Timeout:
-            wait = min(RATE_LIMIT_BASE_WAIT * (2 ** attempt), 90)
-            logger.warning(f"Timeout. Retrying in {wait}s")
-            time.sleep(wait)
-
-    raise Exception("Max retries reached for Groq")
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return clean_llm_output(response.choices[0].message.content)
 
 
 # ================= LLM PROMPT =================
@@ -229,9 +286,6 @@ def call_groq_with_prompt(prompt: str) -> str:
 def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
     """
     Returns False if the LLM returned a prose explanation instead of Kotlin code.
-    Heuristics:
-      - Output is suspiciously short compared to input (< 20% of original length)
-      - Output does not contain any Kotlin-specific tokens
     """
     if not llm_output:
         return False
@@ -243,10 +297,6 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
 
 
 def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
-    """
-    Single unified prompt sent for every chunk (full file or split piece).
-    The LLM receives the raw Kotlin code and returns the fully refactored version.
-    """
     import_instruction = ""
     if is_first_chunk:
         if has_applogger_import:
@@ -327,7 +377,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 is_first_chunk=True,
                 has_applogger_import=has_applogger_import,
             )
-            new_code = call_groq_with_prompt(prompt)
+            new_code = call_llm(prompt)
             n_chunks = 1
 
             if not is_valid_kotlin_output(new_code, original_code):
@@ -349,7 +399,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     has_applogger_import=has_applogger_import,
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
-                result = call_groq_with_prompt(prompt)
+                result = call_llm(prompt)
 
                 if not is_valid_kotlin_output(result, chunk_text):
                     logger.warning(f"{filepath} - chunk {i + 1} returned prose, keeping original chunk")
@@ -431,16 +481,25 @@ def run_refactor_job(job_id: str, request: RefactorRequest):
 # ================= API =================
 
 @app.post("/refactor")
-def run_refactor(request: RefactorRequest, background_tasks: BackgroundTasks, x_api_key: str = Header(None)):
+def run_refactor(
+    request: RefactorRequest,
+    background_tasks: BackgroundTasks,
+    x_api_key: str = Header(None),
+):
     if x_api_key != API_SECRET:
         raise HTTPException(403, "Unauthorized")
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Missing GROQ_API_KEY")
+    if not _model_list:
+        raise HTTPException(500, "No LLM provider configured")
 
     job_id = f"job_{int(time.time())}"
     background_tasks.add_task(run_refactor_job, job_id, request)
 
-    return {"status": "started", "job_id": job_id, "message": "Refactoring running in background"}
+    return {
+        "status":    "started",
+        "job_id":    job_id,
+        "message":   "Refactoring running in background",
+        "providers": _active_providers,
+    }
 
 
 @app.get("/refactor/status/{job_id}")
@@ -460,18 +519,16 @@ def get_status(job_id: str, x_api_key: str = Header(None)):
 @app.get("/")
 def root():
     return {
-        "message": "Refactor Agent API Active",
-        "version": "23.0-stable",
-        "model": GROQ_MODEL,
+        "message":   "Refactor Agent API Active",
+        "version":   "24.0-litellm",
+        "providers": _active_providers,
     }
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {
-        "status": "healthy",
-        "model": GROQ_MODEL,
+        "status":     "healthy",
+        "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
-
-
