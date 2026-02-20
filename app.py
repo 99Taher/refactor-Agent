@@ -19,8 +19,8 @@ import threading
 
 CLONE_DEPTH    = 500
 REQUEST_DELAY  = 10
-CHUNK_SIZE     = 30000   # ~30k chars ≈ ~9,000–10,000 tokens input
-MAX_TOKENS_OUT = 12000
+CHUNK_SIZE     = 12000   # ~30k chars ≈ ~9,000–10,000 tokens input
+MAX_TOKENS_OUT = 8000
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET   = os.getenv("API_SECRET")
@@ -82,7 +82,7 @@ def _build_model_list() -> list:
         models.append({
             "model_name": "llm",
             "litellm_params": {
-                "model":   os.getenv("OPENROUTER_MODEL", "openrouter/deepseek/deepseek-r1:free"),
+                "model":   os.getenv("OPENROUTER_MODEL", "openrouter/meta-llama/llama-3.3-70b-instruct:free"),
                 "api_key": os.getenv("OPENROUTER_API_KEY"),
             }
         })
@@ -532,3 +532,4 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
