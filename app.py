@@ -367,9 +367,16 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
 
     logger.info(f"Refactoring {filepath} ({len(original_code)} chars)")
 
-    # ── Pin one provider for the entire file ──────────────────────────────────
-    chosen_model = _model_list[0]["litellm_params"]["model"]
-    logger.info(f"{filepath} - using provider: {chosen_model}")
+    # ── Pin primary provider, fall back to Router alias if it fails ───────────
+    primary_model = _model_list[0]["litellm_params"]["model"]
+    logger.info(f"{filepath} - using provider: {primary_model}")
+
+    def call_with_fallback(prompt: str) -> str:
+        try:
+            return call_llm(prompt, model=primary_model)   # consistent — same model all chunks
+        except Exception as e:
+            logger.warning(f"{filepath} - primary provider failed ({e.__class__.__name__}), falling back to router alias")
+            return call_llm(prompt, model="llm")           # Router picks next available provider
 
     try:
         lines = original_code.splitlines()
@@ -383,7 +390,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 is_first_chunk=True,
                 has_applogger_import=has_applogger_import,
             )
-            new_code = call_llm(prompt, model=chosen_model)
+            new_code = call_with_fallback(prompt)
             n_chunks = 1
 
             if not is_valid_kotlin_output(new_code, original_code):
@@ -405,7 +412,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     has_applogger_import=has_applogger_import,
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
-                result = call_llm(prompt, model=chosen_model)
+                result = call_with_fallback(prompt)
 
                 if not is_valid_kotlin_output(result, chunk_text):
                     logger.warning(f"{filepath} - chunk {i + 1} returned prose, keeping original chunk")
@@ -538,6 +545,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
