@@ -257,14 +257,16 @@ def split_into_chunks(lines: List[str]) -> List[List[str]]:
 
 # ================= LLM CALL =================
 
-def call_llm(prompt: str) -> str:
+def call_llm(prompt: str, model: str = "llm") -> str:
     """
     Single entry point for all LLM calls.
     The Router automatically handles retries, provider switching,
     rate limit cooldowns and timeouts — no manual retry loop needed.
+    Pass a specific model string to pin the provider, or leave default
+    to let the Router pick freely via the 'llm' alias.
     """
     response = router.completion(
-        model="llm",            # alias — Router picks the actual provider
+        model=model,            # pinned model or alias — Router picks the actual provider
         temperature=0,
         max_tokens=MAX_TOKENS_OUT,
         messages=[
@@ -365,6 +367,10 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
 
     logger.info(f"Refactoring {filepath} ({len(original_code)} chars)")
 
+    # ── Pin one provider for the entire file ──────────────────────────────────
+    chosen_model = _model_list[0]["litellm_params"]["model"]
+    logger.info(f"{filepath} - using provider: {chosen_model}")
+
     try:
         lines = original_code.splitlines()
         has_applogger_import = APPLOGGER_IMPORT in original_code
@@ -377,7 +383,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 is_first_chunk=True,
                 has_applogger_import=has_applogger_import,
             )
-            new_code = call_llm(prompt)
+            new_code = call_llm(prompt, model=chosen_model)
             n_chunks = 1
 
             if not is_valid_kotlin_output(new_code, original_code):
@@ -399,7 +405,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     has_applogger_import=has_applogger_import,
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
-                result = call_llm(prompt)
+                result = call_llm(prompt, model=chosen_model)
 
                 if not is_valid_kotlin_output(result, chunk_text):
                     logger.warning(f"{filepath} - chunk {i + 1} returned prose, keeping original chunk")
@@ -532,5 +538,6 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
