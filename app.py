@@ -121,6 +121,12 @@ router = Router(
 
 # Silence LiteLLM internal logs
 litellm.suppress_debug_info = True
+logging.getLogger("LiteLLM").propagate        = False
+logging.getLogger("LiteLLM Router").propagate = False
+logging.getLogger("LiteLLM Proxy").propagate  = False
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
+logging.getLogger("LiteLLM Proxy").setLevel(logging.WARNING)
 
 # ==========================================
 
@@ -545,6 +551,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
