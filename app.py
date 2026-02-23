@@ -266,14 +266,8 @@ def split_into_chunks(lines: List[str]) -> List[List[str]]:
 
 # ================= LLM CALL =================
 
-def call_llm(prompt: str, model: str = "llm") -> str:
-    """
-    Single entry point for all LLM calls.
-    The Router automatically handles retries, provider switching,
-    rate limit cooldowns and timeouts — no manual retry loop needed.
-    Pass a specific model string to pin the provider, or leave default
-    to let the Router pick freely via the 'llm' alias.
-    """
+def call_llm(prompt: str, model: str = "llm") -> tuple:
+    """Returns (content, actual_model_used)"""
     response = router.completion(
         model=model,
         temperature=0,
@@ -289,15 +283,14 @@ def call_llm(prompt: str, model: str = "llm") -> str:
             {"role": "user", "content": prompt},
         ],
     )
-    # ── Résoudre le vrai nom du modèle utilisé ────────────────────
+    # ── Résoudre le vrai nom du modèle utilisé par le Router ─────────────────
     try:
         actual_model = response.model or model
     except Exception:
         actual_model = model
-    # ─────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     logger.info(f"LLM call complete — model: {GREEN}{actual_model}{RESET}")
-    return clean_llm_output(response.choices[0].message.content)
-
+    return clean_llm_output(response.choices[0].message.content), actual_model
 # ================= LLM PROMPT =================
 
 def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
@@ -419,28 +412,25 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
     primary_model = _model_list[0]["litellm_params"]["model"]
     logger.info(f"{filepath} - using provider: {GREEN}{primary_model}{RESET}")
 
-    # ── Retourne (résultat, modèle_réellement_utilisé) ────────────────────────
     def call_with_fallback(prompt: str, forced_model: str = None) -> tuple:
         model_to_use = forced_model or primary_model
         try:
-            result = call_llm(prompt, model=model_to_use)
-            return result, model_to_use
+            content, actual_model = call_llm(prompt, model=model_to_use)
+            return content, actual_model   # ← vrai modèle retourné
         except Exception as e:
             if forced_model:
-                # Le modèle forcé a échoué — on laisse le Router décider
                 logger.warning(f"{filepath} - forced model {forced_model} failed ({e.__class__.__name__}), falling back to router alias")
             else:
                 logger.warning(f"{filepath} - primary provider failed ({e.__class__.__name__}), falling back to router alias")
-            result = call_llm(prompt, model="llm")
-            # Récupère le vrai modèle utilisé depuis le dernier appel
-            return result, "llm"
+            content, actual_model = call_llm(prompt, model="llm")
+            return content, actual_model   # ← vrai modèle résolu par le Router
 
     try:
         lines = original_code.splitlines()
         has_applogger_import = APPLOGGER_IMPORT in original_code
-        resolved_model = None   # ← sera défini après le chunk 1
+        resolved_model = None
 
-        # ── Small file: send whole file as one chunk ──────────────────────────
+        # ── Small file ────────────────────────────────────────────────────────
         if len(original_code) <= CHUNK_SIZE:
             logger.info(f"{filepath} - small file, single LLM call")
             prompt = build_refactor_prompt(
@@ -455,7 +445,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 logger.warning(f"{filepath} - LLM returned prose instead of code, keeping original")
                 return f"{filepath} - skipped (LLM returned explanation instead of code)"
 
-        # ── Large file: split into chunks, refactor each, reassemble ──────────
+        # ── Large file ────────────────────────────────────────────────────────
         else:
             chunks = split_into_chunks(lines)
             n_chunks = len(chunks)
@@ -471,12 +461,12 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
 
-                # ── Chunk 1 : découverte du modèle ────────────────────────────
                 if i == 0:
+                    # ── Chunk 1 : découverte du vrai modèle ───────────────────
                     result, resolved_model = call_with_fallback(prompt)
                     logger.info(f"{filepath} - {GREEN}model locked: {resolved_model}{RESET} for all remaining chunks")
-                # ── Chunks suivants : modèle verrouillé ───────────────────────
                 else:
+                    # ── Chunks suivants : modèle verrouillé ───────────────────
                     result, resolved_model = call_with_fallback(prompt, forced_model=resolved_model)
 
                 if not is_valid_kotlin_output(result, chunk_text):
@@ -500,6 +490,9 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
 
     except Exception as e:
         return f"{filepath} - error: {str(e)[:100]}"
+
+    # ── Retourne (résultat, modèle_réellement_utilisé) ────────────────────────
+
 
 
 # ================= COMMIT =================
@@ -610,6 +603,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
