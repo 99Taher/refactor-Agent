@@ -25,6 +25,8 @@ MAX_TOKENS_OUT = 8000
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 API_SECRET   = os.getenv("API_SECRET")
 
+GREEN  = "\033[32m"
+RESET  = "\033[0m"
 # Quick-scan prefixes to decide whether a file needs refactoring at all
 LOG_PREFIXES = (
     "Log.d(", "Log.i(", "Log.w(", "Log.e(", "Log.v(",
@@ -287,6 +289,7 @@ def call_llm(prompt: str, model: str = "llm") -> str:
             {"role": "user", "content": prompt},
         ],
     )
+    logger.info(f"LLM call complete — model: {GREEN}{model}{RESET}")
     return clean_llm_output(response.choices[0].message.content)
 
 
@@ -376,7 +379,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
 
     # ── Pin primary provider, fall back to Router alias if it fails ───────────
     primary_model = _model_list[0]["litellm_params"]["model"]
-    logger.info(f"{filepath} - using provider: {primary_model}")
+    logger.info(f"{filepath} - using provider: {GREEN}{primary_model}{RESET}")
 
     def call_with_fallback(prompt: str) -> str:
         try:
@@ -437,8 +440,8 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
             return f"{filepath} - skipped (LLM made no changes)"
 
         full_path.write_text(new_code, encoding="utf-8")
-        logger.info(f"{filepath} - written ({n_chunks} chunk(s))")
-        return f"{filepath} - refactored ({n_chunks} chunk(s))"
+        logger.info(f"{filepath} - {GREEN}written{RESET} ({n_chunks} chunk(s))")
+        return f"{filepath} - {GREEN}refactored{RESET} ({n_chunks} chunk(s))"
 
     except Exception as e:
         return f"{filepath} - error: {str(e)[:100]}"
@@ -552,6 +555,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
