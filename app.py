@@ -275,7 +275,7 @@ def call_llm(prompt: str, model: str = "llm") -> str:
     to let the Router pick freely via the 'llm' alias.
     """
     response = router.completion(
-        model=model,            # pinned model or alias — Router picks the actual provider
+        model=model,
         temperature=0,
         max_tokens=MAX_TOKENS_OUT,
         messages=[
@@ -289,9 +289,14 @@ def call_llm(prompt: str, model: str = "llm") -> str:
             {"role": "user", "content": prompt},
         ],
     )
-    logger.info(f"LLM call complete — model: {GREEN}{model}{RESET}")
+    # ── Résoudre le vrai nom du modèle utilisé ────────────────────
+    try:
+        actual_model = response.model or model
+    except Exception:
+        actual_model = model
+    # ─────────────────────────────────────────────────────────────
+    logger.info(f"LLM call complete — model: {GREEN}{actual_model}{RESET}")
     return clean_llm_output(response.choices[0].message.content)
-
 
 # ================= LLM PROMPT =================
 
@@ -301,10 +306,17 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
     """
     if not llm_output:
         return False
+    # ── Rejet si trop court (prose au lieu de code) ───────────────
     if len(llm_output) < len(original) * 0.20:
         kotlin_tokens = ("fun ", "val ", "var ", "class ", "import ", "package ", "object ", "return ", "{", "}")
         if not any(t in llm_output for t in kotlin_tokens):
             return False
+    # ── Rejet si le LLM a drastiquement changé la taille du fichier ──
+    # Un refactoring de logs ne devrait jamais changer la taille de plus de 20%
+    size_ratio = len(llm_output) / len(original) if len(original) > 0 else 1
+    if size_ratio < 0.80 or size_ratio > 1.20:
+        logger.warning(f"LLM output size ratio {size_ratio:.2f} suspicious — possible unwanted changes")
+        return False
     return True
 
 
@@ -349,9 +361,13 @@ def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import
         "",
         "IMPORTS (apply only if import statements appear in this block):",
         import_instruction,
-        "STRICT RULES:",
+        "STRICT RULES — READ CAREFULLY:",
+        "  - You are a MECHANICAL text replacer, NOT a code reviewer.",  # ← nouveau
+        "  - ONLY modify lines that match the log patterns above.",       # ← nouveau
+        "  - ALL other lines must be returned CHARACTER FOR CHARACTER, with zero modifications.", # ← nouveau
+        "  - Do NOT fix bugs, do NOT improve code, do NOT rename variables.", # ← nouveau
+        "  - Do NOT reformat, do NOT add/remove blank lines.",            # ← nouveau
         "  - Preserve the EXACT indentation and formatting of every line.",
-        "  - Do NOT touch any line that is not a log call or a relevant import.",
         "  - Do NOT add explanations, comments, or markdown — return raw Kotlin code only.",
         "  - If there is NOTHING to convert or fix, return the code EXACTLY as received, character for character.",
         "  - NEVER write sentences like 'No changes needed' or 'The code already uses AppLogger'.",
@@ -555,6 +571,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
