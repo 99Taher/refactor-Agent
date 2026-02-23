@@ -325,14 +325,14 @@ def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import
     if is_first_chunk:
         if has_applogger_import:
             import_instruction = (
-                f"  - The import `{APPLOGGER_IMPORT}` is already present — keep it.\n"
+                f"  - The import `{APPLOGGER_IMPORT}` is already present — keep it as-is.\n"
             )
         else:
             import_instruction = (
                 f"  - Add `{APPLOGGER_IMPORT}` next to the other import statements.\n"
             )
         import_instruction += (
-            "  - REMOVE any of these imports if present:\n"
+            "  - REMOVE only these exact imports if present, touch nothing else:\n"
             "      import android.util.Log\n"
             "      import android.util.Logr\n"
             "      import com.streamwide.smartms.lib.core.api.logger.AppSTLogger\n"
@@ -342,38 +342,61 @@ def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import
         )
 
     return "\n".join([
-        "Refactor the Kotlin code below following ONLY these rules:",
+        "You are a MECHANICAL TEXT REPLACER. You do NOT understand code. You only find and replace specific text patterns.",
+        "You have NO opinion about the code. You do NOT improve, fix, optimize, or reformat anything.",
+        "You are FORBIDDEN from changing any line that is not in the list of patterns below.",
         "",
-        "LOG CONVERSION:",
-        "  - Log.d(TAG, msg)   ->  AppLogger.d(TAG, msg)",
-        "  - Log.i(TAG, msg)   ->  AppLogger.i(TAG, msg)",
-        "  - Log.w(TAG, msg)   ->  AppLogger.w(TAG, msg)",
-        "  - Log.e(TAG, msg)   ->  AppLogger.e(TAG, msg)",
-        "  - Logr.d/i/w/e(TAG, msg) -> AppLogger.d/i/w/e(TAG, msg)",
-        "  - AppSTLogger.appendLogST(STLevelLog.DEBUG, t, m) -> AppLogger.d(t, m)",
-        "  - AppSTLogger.appendLogST(STLevelLog.INFO,  t, m) -> AppLogger.i(t, m)",
-        "  - AppSTLogger.appendLogST(STLevelLog.WARN,  t, m) -> AppLogger.w(t, m)",
-        "  - AppSTLogger.appendLogST(STLevelLog.ERROR, t, m) -> AppLogger.e(t, m)",
-        "  - Lines already using AppLogger.x(...) -> keep them exactly as-is.",
+        "════════════════════════════════════════════════",
+        "THE ONLY REPLACEMENTS YOU ARE ALLOWED TO MAKE:",
+        "════════════════════════════════════════════════",
         "",
-        "DEDUPLICATION:",
-        "  - If two or more consecutive lines are identical AppLogger calls -> keep only ONE.",
+        "PATTERN 1 — Replace log calls:",
+        "  Log.d(...)   →  AppLogger.d(...)",
+        "  Log.i(...)   →  AppLogger.i(...)",
+        "  Log.w(...)   →  AppLogger.w(...)",
+        "  Log.e(...)   →  AppLogger.e(...)",
+        "  Log.v(...)   →  AppLogger.v(...)",
+        "  Logr.d(...)  →  AppLogger.d(...)",
+        "  Logr.i(...)  →  AppLogger.i(...)",
+        "  Logr.w(...)  →  AppLogger.w(...)",
+        "  Logr.e(...)  →  AppLogger.e(...)",
+        "  Logr.v(...)  →  AppLogger.v(...)",
+        "  AppSTLogger.appendLogST(STLevelLog.DEBUG, t, m)  →  AppLogger.d(t, m)",
+        "  AppSTLogger.appendLogST(STLevelLog.INFO,  t, m)  →  AppLogger.i(t, m)",
+        "  AppSTLogger.appendLogST(STLevelLog.WARN,  t, m)  →  AppLogger.w(t, m)",
+        "  AppSTLogger.appendLogST(STLevelLog.ERROR, t, m)  →  AppLogger.e(t, m)",
         "",
-        "IMPORTS (apply only if import statements appear in this block):",
+        "PATTERN 2 — Remove duplicate consecutive AppLogger calls:",
+        "  If two or more consecutive lines are IDENTICAL AppLogger calls → keep only the first one.",
+        "  Do NOT deduplicate non-consecutive lines.",
+        "",
+        "PATTERN 3 — Imports (ONLY if this block contains import statements):",
         import_instruction,
-        "STRICT RULES — READ CAREFULLY:",
-        "  - You are a MECHANICAL text replacer, NOT a code reviewer.",  # ← nouveau
-        "  - ONLY modify lines that match the log patterns above.",       # ← nouveau
-        "  - ALL other lines must be returned CHARACTER FOR CHARACTER, with zero modifications.", # ← nouveau
-        "  - Do NOT fix bugs, do NOT improve code, do NOT rename variables.", # ← nouveau
-        "  - Do NOT reformat, do NOT add/remove blank lines.",            # ← nouveau
-        "  - Preserve the EXACT indentation and formatting of every line.",
-        "  - Do NOT add explanations, comments, or markdown — return raw Kotlin code only.",
-        "  - If there is NOTHING to convert or fix, return the code EXACTLY as received, character for character.",
-        "  - NEVER write sentences like 'No changes needed' or 'The code already uses AppLogger'.",
-        "  - Your response MUST always be valid Kotlin code, nothing else.",
+        "════════════════════════════════════════════════",
+        "ABSOLUTE PROHIBITIONS — YOU WILL NEVER:",
+        "════════════════════════════════════════════════",
+        "  ✗ Add new code of any kind",
+        "  ✗ Delete any line that is not a duplicate AppLogger call or a removed import",
+        "  ✗ Rename any variable, parameter, class, or function",
+        "  ✗ Change indentation or whitespace",
+        "  ✗ Add or remove blank lines",
+        "  ✗ Reorder any lines",
+        "  ✗ Fix bugs or improve logic",
+        "  ✗ Add comments or documentation",
+        "  ✗ Change string contents inside log messages",
+        "  ✗ Wrap or unwrap any expression",
+        "  ✗ Write explanations, notes, or markdown",
+        "  ✗ Write 'No changes needed' or any sentence — ONLY return code",
         "",
-        "CODE:",
+        "════════════════════════════════════════════════",
+        "OUTPUT RULES:",
+        "════════════════════════════════════════════════",
+        "  - Return the full code block with ONLY the above patterns replaced.",
+        "  - Every line not matching a pattern above must be returned BYTE FOR BYTE.",
+        "  - Do NOT wrap output in markdown, backticks, or any formatting.",
+        "  - Your output will be written directly to a .kt file — any non-Kotlin character will break the build.",
+        "",
+        "CODE TO PROCESS:",
         chunk,
     ])
 
@@ -393,20 +416,29 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
 
     logger.info(f"Refactoring {filepath} ({len(original_code)} chars)")
 
-    # ── Pin primary provider, fall back to Router alias if it fails ───────────
     primary_model = _model_list[0]["litellm_params"]["model"]
     logger.info(f"{filepath} - using provider: {GREEN}{primary_model}{RESET}")
 
-    def call_with_fallback(prompt: str) -> str:
+    # ── Retourne (résultat, modèle_réellement_utilisé) ────────────────────────
+    def call_with_fallback(prompt: str, forced_model: str = None) -> tuple:
+        model_to_use = forced_model or primary_model
         try:
-            return call_llm(prompt, model=primary_model)   # consistent — same model all chunks
+            result = call_llm(prompt, model=model_to_use)
+            return result, model_to_use
         except Exception as e:
-            logger.warning(f"{filepath} - primary provider failed ({e.__class__.__name__}), falling back to router alias")
-            return call_llm(prompt, model="llm")           # Router picks next available provider
+            if forced_model:
+                # Le modèle forcé a échoué — on laisse le Router décider
+                logger.warning(f"{filepath} - forced model {forced_model} failed ({e.__class__.__name__}), falling back to router alias")
+            else:
+                logger.warning(f"{filepath} - primary provider failed ({e.__class__.__name__}), falling back to router alias")
+            result = call_llm(prompt, model="llm")
+            # Récupère le vrai modèle utilisé depuis le dernier appel
+            return result, "llm"
 
     try:
         lines = original_code.splitlines()
         has_applogger_import = APPLOGGER_IMPORT in original_code
+        resolved_model = None   # ← sera défini après le chunk 1
 
         # ── Small file: send whole file as one chunk ──────────────────────────
         if len(original_code) <= CHUNK_SIZE:
@@ -416,7 +448,7 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                 is_first_chunk=True,
                 has_applogger_import=has_applogger_import,
             )
-            new_code = call_with_fallback(prompt)
+            new_code, _ = call_with_fallback(prompt)
             n_chunks = 1
 
             if not is_valid_kotlin_output(new_code, original_code):
@@ -438,7 +470,14 @@ def refactor_file(repo_path: Path, filepath: str) -> str:
                     has_applogger_import=has_applogger_import,
                 )
                 logger.info(f"{filepath} - chunk {i + 1}/{n_chunks} ({len(chunk_text)} chars)")
-                result = call_with_fallback(prompt)
+
+                # ── Chunk 1 : découverte du modèle ────────────────────────────
+                if i == 0:
+                    result, resolved_model = call_with_fallback(prompt)
+                    logger.info(f"{filepath} - {GREEN}model locked: {resolved_model}{RESET} for all remaining chunks")
+                # ── Chunks suivants : modèle verrouillé ───────────────────────
+                else:
+                    result, resolved_model = call_with_fallback(prompt, forced_model=resolved_model)
 
                 if not is_valid_kotlin_output(result, chunk_text):
                     logger.warning(f"{filepath} - chunk {i + 1} returned prose, keeping original chunk")
@@ -571,6 +610,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
