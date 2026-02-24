@@ -313,7 +313,7 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
 
 def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
     import_instruction = ""
-    if is_first_chunk:
+   if is_first_chunk:
         if has_applogger_import:
             import_instruction = (
                 f"  - The import `{APPLOGGER_IMPORT}` is already present — keep it as-is.\n"
@@ -323,13 +323,15 @@ def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import
                 f"  - Add `{APPLOGGER_IMPORT}` next to the other import statements.\n"
             )
         import_instruction += (
-            "  - REMOVE only these exact imports if present, touch nothing else:\n"
+            "  - REMOVE ONLY these EXACT lines if they exist, and touch NOTHING else:\n"
             "      import android.util.Log\n"
             "      import android.util.Logr\n"
             "      import com.streamwide.smartms.lib.core.api.logger.AppSTLogger\n"
             "      import com.streamwide.smartms.lib.core.api.logger.STLevelLog\n"
             "      import com.streamwide.smartms.lib.core.api.AppSTLogger\n"
             "      import com.streamwide.smartms.lib.core.STLevelLog\n"
+            "  - KEEP every other import statement unchanged, even if it looks unused.\n"
+            "  - DO NOT analyze imports for usage — just remove the 6 lines above if present.\n"
         )
 
     return "\n".join([
@@ -601,6 +603,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
