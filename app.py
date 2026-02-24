@@ -69,7 +69,6 @@ def _build_model_list() -> list:
     """
     models = []
 
-    # ── 1. Groq (primary — fastest, 14,400 req/day free) ─────────
     if os.getenv("GROQ_API_KEY"):
         models.append({
             "model_name": "llm",
@@ -78,8 +77,14 @@ def _build_model_list() -> list:
                 "api_key": os.getenv("GROQ_API_KEY"),
             }
         })
-
-    # ── 2. OpenRouter (fallback 1 — 300+ models, free tier) ──────
+    if os.getenv("HUGGINGFACE_API_KEY"):
+        models.append({
+            "model_name": "llm",
+            "litellm_params": {
+                "model":   os.getenv("HUGGINGFACE_MODEL", "huggingface/Qwen/Qwen2.5-72B-Instruct"),
+                "api_key": os.getenv("HUGGINGFACE_API_KEY"),
+            }
+        })
     if os.getenv("OPENROUTER_API_KEY"):
         models.append({
             "model_name": "llm",
@@ -89,15 +94,7 @@ def _build_model_list() -> list:
             }
         })
 
-    # ── 3. Hugging Face (fallback 2 — free inference API) ────────
-    if os.getenv("HUGGINGFACE_API_KEY"):
-        models.append({
-            "model_name": "llm",
-            "litellm_params": {
-                "model":   os.getenv("HUGGINGFACE_MODEL", "huggingface/Qwen/Qwen2.5-72B-Instruct"),
-                "api_key": os.getenv("HUGGINGFACE_API_KEY"),
-            }
-        })
+    
 
     return models
 
@@ -603,6 +600,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
