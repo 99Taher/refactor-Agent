@@ -48,7 +48,7 @@ APPLOGGER_IMPORT = "import com.honeywell.domain.managers.loggerApp.AppLogger"
 # │ GROQ_API_KEY            │ gsk_...          (get at console.groq.com)       │
 # │ GROQ_MODEL              │ groq/qwen/qwen3-32b          (optional)          │
 # │ OPENROUTER_API_KEY      │ sk-or-...        (get at openrouter.ai)          │
-# │ OPENROUTER_MODEL        │ openrouter/deepseek/deepseek-r1:free  (optional) │
+# │ OPENROUTER_MODEL        │ openrouter/openrouter/free  (optional) │
 # │ HUGGINGFACE_API_KEY     │ hf_...           (get at huggingface.co)         │
 # │ HUGGINGFACE_MODEL       │ huggingface/Qwen/Qwen2.5-72B-Instruct (optional) │
 # │ GITHUB_TOKEN            │ ghp_...                                          │
@@ -603,6 +603,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
