@@ -310,52 +310,81 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
         return False
     return True
 def verify_refactoring(repo_path: Path) -> dict:
-    """
-    Runs Kotlin compilation + unit tests on the refactored repo.
-    Returns a dict with success status and output details.
-    """
     logger.info("Running post-refactor verification...")
 
-    # Step 1 — Compile only (fast, catches import/syntax errors)
-    compile_result = subprocess.run(
-        ["./gradlew", "compileDebugKotlin", "--no-daemon", "--stacktrace"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-    if compile_result.returncode != 0:
-        logger.error("Compilation FAILED after refactoring!")
+    # ── Diagnostic avant de lancer Gradle ────────────────────────────────
+    gradlew = repo_path / "gradlew"
+    logger.info(f"gradlew exists: {gradlew.exists()}")
+    if gradlew.exists():
+        import stat
+        st = gradlew.stat()
+        is_exec = bool(st.st_mode & stat.S_IXUSR)
+        logger.info(f"gradlew executable: {is_exec}")
+        if not is_exec:
+            logger.info("gradlew not executable — fixing permissions...")
+            gradlew.chmod(st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    else:
+        logger.error(f"gradlew NOT FOUND at {gradlew} — listing repo root:")
+        for f in repo_path.iterdir():
+            logger.info(f"  {f.name}")
         return {
             "success": False,
             "stage": "compile",
-            "stdout": compile_result.stdout[-3000:],  # last 3k chars
-            "stderr": compile_result.stderr[-3000:],
+            "stdout": "gradlew not found in repo root",
+            "stderr": "",
         }
+    # ─────────────────────────────────────────────────────────────────────
 
-    logger.info("Compilation passed ✓")
+    try:
+        compile_result = subprocess.run(
+            ["./gradlew", "compileDebugKotlin", "--no-daemon", "--stacktrace"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
 
-    # Step 2 — Unit tests (optional but recommended)
-    test_result = subprocess.run(
-        ["./gradlew", "testDebugUnitTest", "--no-daemon"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+        if compile_result.returncode != 0:
+            logger.error("Compilation FAILED after refactoring!")
+            logger.error(f"STDOUT:\n{compile_result.stdout[-3000:]}")
+            logger.error(f"STDERR:\n{compile_result.stderr[-3000:]}")
+            return {
+                "success": False,
+                "stage": "compile",
+                "stdout": compile_result.stdout[-3000:],
+                "stderr": compile_result.stderr[-3000:],
+            }
 
-    if test_result.returncode != 0:
-        logger.warning("Unit tests FAILED after refactoring!")
-        return {
-            "success": False,
-            "stage": "unit_tests",
-            "stdout": test_result.stdout[-3000:],
-            "stderr": test_result.stderr[-3000:],
-        }
+        logger.info("Compilation passed ✓")
 
-    logger.info("Unit tests passed ✓")
-    return {"success": True, "stage": "all_passed"}    
+        test_result = subprocess.run(
+            ["./gradlew", "testDebugUnitTest", "--no-daemon"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+
+        if test_result.returncode != 0:
+            logger.warning("Unit tests FAILED after refactoring!")
+            logger.error(f"STDOUT:\n{test_result.stdout[-3000:]}")
+            logger.error(f"STDERR:\n{test_result.stderr[-3000:]}")
+            return {
+                "success": False,
+                "stage": "unit_tests",
+                "stdout": test_result.stdout[-3000:],
+                "stderr": test_result.stderr[-3000:],
+            }
+
+        logger.info("Unit tests passed ✓")
+        return {"success": True, "stage": "all_passed"}
+
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Gradle timeout: {e}")
+        return {"success": False, "stage": "compile", "stdout": "", "stderr": f"Timeout: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Gradle exception: {e}")
+        return {"success": False, "stage": "compile", "stdout": "", "stderr": str(e)} 
 
 
 def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
@@ -668,6 +697,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
