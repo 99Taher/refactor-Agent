@@ -309,6 +309,53 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
         logger.warning(f"LLM output size ratio {size_ratio:.2f} suspicious — possible unwanted changes")
         return False
     return True
+def verify_refactoring(repo_path: Path) -> dict:
+    """
+    Runs Kotlin compilation + unit tests on the refactored repo.
+    Returns a dict with success status and output details.
+    """
+    logger.info("Running post-refactor verification...")
+
+    # Step 1 — Compile only (fast, catches import/syntax errors)
+    compile_result = subprocess.run(
+        ["./gradlew", "compileDebugKotlin", "--no-daemon", "--stacktrace"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+    if compile_result.returncode != 0:
+        logger.error("Compilation FAILED after refactoring!")
+        return {
+            "success": False,
+            "stage": "compile",
+            "stdout": compile_result.stdout[-3000:],  # last 3k chars
+            "stderr": compile_result.stderr[-3000:],
+        }
+
+    logger.info("Compilation passed ✓")
+
+    # Step 2 — Unit tests (optional but recommended)
+    test_result = subprocess.run(
+        ["./gradlew", "testDebugUnitTest", "--no-daemon"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    if test_result.returncode != 0:
+        logger.warning("Unit tests FAILED after refactoring!")
+        return {
+            "success": False,
+            "stage": "unit_tests",
+            "stdout": test_result.stdout[-3000:],
+            "stderr": test_result.stderr[-3000:],
+        }
+
+    logger.info("Unit tests passed ✓")
+    return {"success": True, "stage": "all_passed"}    
 
 
 def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
@@ -537,11 +584,29 @@ def run_refactor_job(job_id: str, request: RefactorRequest):
                 _jobs[job_id]["files"] = list(results)
             logger.info(f"[{job_id}] {result}")
 
+        # ── Only run verification + commit if something was actually refactored ──
         if any("refactored" in r for r in results):
+
+            # ── Integration check before pushing ─────────────────────────────
+            verification = verify_refactoring(repo_path)
+            with _jobs_lock:
+                _jobs[job_id]["verification"] = verification
+
+            if not verification["success"]:
+                logger.error(f"[{job_id}] Verification failed at stage: {verification['stage']} — aborting push")
+                with _jobs_lock:
+                    _jobs[job_id]["status"] = "error"
+                    _jobs[job_id]["error"] = f"Build/tests failed at: {verification['stage']}"
+                return  # ← do NOT commit broken code
+
             commit_and_push(repo_path)
 
         with _jobs_lock:
-            _jobs[job_id] = {"status": "done", "files": results}
+            _jobs[job_id] = {
+                "status": "done",
+                "files": results,
+                "verification": verification if any("refactored" in r for r in results) else "skipped"
+            }
 
     except Exception as e:
         logger.error(f"[{job_id}] Job failed: {e}")
@@ -603,6 +668,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
