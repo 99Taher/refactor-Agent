@@ -309,32 +309,61 @@ def is_valid_kotlin_output(llm_output: str, original: str) -> bool:
         logger.warning(f"LLM output size ratio {size_ratio:.2f} suspicious — possible unwanted changes")
         return False
     return True
+def ensure_java(repo_path: Path) -> dict | None:
+    """
+    Vérifie que Java est disponible.
+    Si non, tente de l'installer (Render free tier = Ubuntu).
+    Retourne None si OK, ou un dict d'erreur.
+    """
+    import shutil
+
+    if shutil.which("java"):
+        logger.info("Java found ✓")
+        return None
+
+    logger.warning("Java not found — attempting install...")
+    result = subprocess.run(
+        ["apt-get", "install", "-y", "-qq", "openjdk-17-jdk-headless"],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    if result.returncode != 0:
+        return {
+            "success": False,
+            "stage":   "compile",
+            "stdout":  "Java not installed and auto-install failed:\n" + result.stdout,
+            "stderr":  result.stderr,
+        }
+
+    # Définir JAVA_HOME pour le processus courant
+    java_home = "/usr/lib/jvm/java-17-openjdk-amd64"
+    os.environ["JAVA_HOME"] = java_home
+    os.environ["PATH"] = f"{java_home}/bin:" + os.environ.get("PATH", "")
+    logger.info("Java installed successfully ✓")
+    return None
+
+
 def verify_refactoring(repo_path: Path) -> dict:
     logger.info("Running post-refactor verification...")
 
-    # ── Diagnostic avant de lancer Gradle ────────────────────────────────
+    # ── Gradlew check ─────────────────────────────────────────────────────
     gradlew = repo_path / "gradlew"
     logger.info(f"gradlew exists: {gradlew.exists()}")
     if gradlew.exists():
         import stat
         st = gradlew.stat()
-        is_exec = bool(st.st_mode & stat.S_IXUSR)
-        logger.info(f"gradlew executable: {is_exec}")
-        if not is_exec:
-            logger.info("gradlew not executable — fixing permissions...")
+        if not bool(st.st_mode & stat.S_IXUSR):
             gradlew.chmod(st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     else:
-        logger.error(f"gradlew NOT FOUND at {gradlew} — listing repo root:")
-        for f in repo_path.iterdir():
-            logger.info(f"  {f.name}")
-        return {
-            "success": False,
-            "stage": "compile",
-            "stdout": "gradlew not found in repo root",
-            "stderr": "",
-        }
-    # ─────────────────────────────────────────────────────────────────────
+        return {"success": False, "stage": "compile",
+                "stdout": "gradlew not found in repo root", "stderr": ""}
 
+    # ── Java check ────────────────────────────────────────────────────────
+    java_error = ensure_java(repo_path)
+    if java_error:
+        return java_error
+
+    # ── Compile ───────────────────────────────────────────────────────────
     try:
         compile_result = subprocess.run(
             ["./gradlew", "compileDebugKotlin", "--no-daemon", "--stacktrace"],
@@ -342,6 +371,7 @@ def verify_refactoring(repo_path: Path) -> dict:
             capture_output=True,
             text=True,
             timeout=300,
+            env={**os.environ},   # ← propage JAVA_HOME
         )
 
         if compile_result.returncode != 0:
@@ -350,9 +380,9 @@ def verify_refactoring(repo_path: Path) -> dict:
             logger.error(f"STDERR:\n{compile_result.stderr[-3000:]}")
             return {
                 "success": False,
-                "stage": "compile",
-                "stdout": compile_result.stdout[-3000:],
-                "stderr": compile_result.stderr[-3000:],
+                "stage":   "compile",
+                "stdout":  compile_result.stdout[-3000:],
+                "stderr":  compile_result.stderr[-3000:],
             }
 
         logger.info("Compilation passed ✓")
@@ -363,28 +393,25 @@ def verify_refactoring(repo_path: Path) -> dict:
             capture_output=True,
             text=True,
             timeout=600,
+            env={**os.environ},
         )
 
         if test_result.returncode != 0:
-            logger.warning("Unit tests FAILED after refactoring!")
-            logger.error(f"STDOUT:\n{test_result.stdout[-3000:]}")
-            logger.error(f"STDERR:\n{test_result.stderr[-3000:]}")
+            logger.warning("Unit tests FAILED!")
             return {
                 "success": False,
-                "stage": "unit_tests",
-                "stdout": test_result.stdout[-3000:],
-                "stderr": test_result.stderr[-3000:],
+                "stage":   "unit_tests",
+                "stdout":  test_result.stdout[-3000:],
+                "stderr":  test_result.stderr[-3000:],
             }
 
         logger.info("Unit tests passed ✓")
         return {"success": True, "stage": "all_passed"}
 
     except subprocess.TimeoutExpired as e:
-        logger.error(f"Gradle timeout: {e}")
-        return {"success": False, "stage": "compile", "stdout": "", "stderr": f"Timeout: {str(e)}"}
+        return {"success": False, "stage": "compile", "stdout": "", "stderr": f"Timeout: {e}"}
     except Exception as e:
-        logger.error(f"Gradle exception: {e}")
-        return {"success": False, "stage": "compile", "stdout": "", "stderr": str(e)} 
+        return {"success": False, "stage": "compile", "stdout": "", "stderr": str(e)}
 
 
 def build_refactor_prompt(chunk: str, is_first_chunk: bool, has_applogger_import: bool) -> str:
@@ -697,6 +724,7 @@ def health():
         "providers":  _active_providers,
         "chunk_size": CHUNK_SIZE,
     }
+
 
 
 
